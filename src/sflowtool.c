@@ -18,7 +18,7 @@
  */
 /* Copyright (c) 2002-2011 InMon Corp. Licensed under the terms of the InMon sFlow licence: */
 /* http://www.inmon.com/technology/sflowlicense.txt */
-//hello
+
 #if defined(__cplusplus)
 extern "C" {
 #endif
@@ -30,6 +30,7 @@ extern "C" {
 #endif
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,7 +60,9 @@ extern "C" {
 #include <leveldb/c.h>
 #include <json.h>
 #include "parse_flags.h"
-#include<pthread.h>
+#include <pthread.h>
+#include "sht.h"
+
 
 // If the platform is Linux, enable the source-spoofing feature too.
 #ifdef linux
@@ -78,8 +81,8 @@ extern "C" {
 #endif
 */
 
-#define RAW_DB "raw_db"
-#define OBJ_DB "obj_db"
+#define RAW_DB "record-sec"
+#define UUID_STORE "uuid_store"
 
 /* just do it in a portable way... */
 static uint32_t MyByteSwap32(uint32_t n)
@@ -270,6 +273,16 @@ struct sfl_a10_custom_info {
         u32 vnp_id;
 }__attribute__((packed));
 
+static uint32_t get_slot_id(uint32_t slot_vnp_id)
+{
+    return (((slot_vnp_id & 0x00FF0000) >> 16) | ((slot_vnp_id & 0x0000FF00) >> 8));
+}
+
+static uint32_t get_vnp_id(uint32_t slot_vnp_id)
+{
+    /* < 1 byte reserved > < 1 byte chassis slot-id > < 2 byte vnp_id > */
+    return (slot_vnp_id & 0x0000FFFF);
+}
 
 static SFCommonLogFormat sfCLF;
 static const char *SFHTTP_method_names[] = { "-", "OPTIONS", "GET", "HEAD", "POST", "PUT", "DELETE", "TRACE", "CONNECT" };
@@ -492,45 +505,13 @@ typedef struct _NFFlowPkt5 {
     NFFlow5 flow; /* normally an array, but here we always send just 1 at a time */
 } NFFlowPkt5;
 
+sht_t *uuidtable = NULL;
+#define NUM_UUIDS 30000
+#define NUM_SHT_BUCKETS NUM_UUIDS/3
+
 static void readFlowSample_header(SFSample *sample);
 static void readFlowSample(SFSample *sample, int expanded);
 
-static u64 packet_anomaly_passed = 0;
-static u64 packet_anomaly_dropped = 0;
-
-static u64 dst_rates_dropped = 0;
-
-static u64 port_wildcards_dropped = 0;
-
-static u64 port_cm_dropped = 0;
-
-static u64 src_rates_dropped = 0;
-
-static u64 http_dropped = 0;
-
-static u64 http_excl_src_dropped = 0;
-
-static u64 http_challenge_sent = 0;
-
-static u64 dst_http_challenge_sent = 0;
-
-static u64 dns_dropped = 0;
-
-static u64 dns_excl_src_dropped = 0;
-
-static u64 src_auth_dropped = 0;
-
-static u64 ip_proto_dropped = 0;
-
-static u64 icmp_dropped = 0;
-
-char tsdb_buff[5000];
-
-int g_opentsdb_socket_connected = 0;
-int g_opentsdb_sock;
-
-int g_leveldb_socket_connected = 0;
-int g_leveldb_sock;
 
 void
 ignore_sigpipe(void)
@@ -581,8 +562,25 @@ void custom_exit(int code)
   -----------------___________________________------------------
 */
 
+int debug_print = 0;
+
 void sf_log(char *fmt, ...)
 {
+    /* don't print anything if we are exporting tcpdump format or tabular format instead */
+    if (sfConfig.outputFormat == SFLFMT_FULL) {
+        va_list args;
+        va_start(args, fmt);
+        if (vprintf(fmt, args) < 0) {
+            custom_exit(-40);
+        }
+    }
+}
+
+void sf_debug(char *fmt, ...)
+{
+    if (debug_print == 0)
+        return;
+
     /* don't print anything if we are exporting tcpdump format or tabular format instead */
     if (sfConfig.outputFormat == SFLFMT_FULL) {
         va_list args;
@@ -1815,15 +1813,6 @@ static uint64_t sf_log_next64(SFSample *sample, char *fieldName)
     uint64_t val64 = getData64(sample);
     sf_log("%-35s %-20"PRIu64"\n", fieldName, val64);
     return val64;
-}
-
-int opentsdb_print_next64(SFSample *sample, char *tbuf, int len, char *fieldName)
-{
-        long tstamp = time(NULL);
-        uint64_t val64 = getData64(sample);
-        len = sprintf (tsdb_buff + len, "%s%lu %lu %s", fieldName, (long )tstamp, (long )val64, tbuf);
-        //len = sprintf (tsdb_buff + len, "%s %lu %lu", fieldName, tstamp, val64);
-        return len;
 }
 
 void sf_log_percentage(SFSample *sample, char *fieldName)
@@ -3287,64 +3276,1363 @@ uint64_t ntohll(uint64_t val) {
     return (((uint64_t) ntohl(val)) << 32) + ntohl(val >> 32);
 }
 
-static void readCounters_a10_generic(SFSample *sample)
+#define ALL_SLOTS 3
+int received_from_all_slots(slots_rcvd_so_far, slot_new_rcvd)
 {
-	printf("\n<<Inside readCounters_a10_generic>>>\n");
-        int len = 0;
-        long tstamp = time(NULL);
-        char tbuf [200];
-        sprintf (tbuf, "agent=%08x\n", htonl(sample->agent_addr.address.ip_v4.addr));
-        tbuf[strlen(tbuf)] = 0;
-        struct sfl_a10_custom_info *a10_custom = (struct sfl_a10_custom_info *)(sample->datap);
-        sample->datap =  (u_char *)sample->datap + sizeof(struct sfl_a10_custom_info);
-        printf("uuid = %s\n", a10_custom->uuid);
-        int obj_stats_oid = ntohl(a10_custom->schema_oid);
-        printf("obj_stats_oid = %d \n", obj_stats_oid);
-        printf("schema oid = %d\n", obj_stats_oid);
-        printf("vnp_id of ctr = %d\n", ntohl(a10_custom->vnp_id));
-        sample->current_context_length = sample->current_context_length-sizeof(struct sfl_a10_custom_info);
-        int number_of_counters =  sample->current_context_length/sizeof(struct sflow_flex_kv);
-        printf("Number of counters = %d\n", number_of_counters);
-        struct sflow_flex_kv *kv = (struct sflow_flex_kv *)(sample->datap);
-        int i;
-
-	if (strlen(a10_custom->uuid) != 36){
-        	return;         
-	}
-	for(i = 0; i<number_of_counters; i++){
-		if (strlen(a10_custom->uuid) != 36) {
-			continue;
-		}
-		printf("key = %d value  = %ld\n", ntohl(kv[i].key), ntohll(kv[i].value));
-	}
-       // int ret = leveldb_simple_connect(tsdb_buff);
-        skipBytes(sample, sample->current_context_length);
-}
-
-
-void write_object_id(char *obj_id, int oid, char *uuid)
-{
-    char object_data_db[] = OBJ_DB;
-    int ret = leveldb_simple_read_data(obj_id, object_data_db);
-    if ( !ret ) {
-        json_object *root;
-        root = json_object_new_object();
-        json_object_object_add(root, "oid", json_object_new_int(oid));
-        json_object_object_add(root, "uuid", json_object_new_string(uuid));
-        leveldb_simple_write_data(obj_id, json_object_to_json_string(root), object_data_db);
-        json_object_put(root);
+    if (((slots_rcvd_so_far & slot_new_rcvd) == slot_new_rcvd) || // a & c
+        (slots_rcvd_so_far == ALL_SLOTS)) {                       // b
+        return 1;
+    } else {
+        return 0;
     }
 }
 
+int send_zone_stats(const char *uuid, stat_zone_t *stats_p,
+        const char *agent_info, leveldb_t *db1, leveldb_t *db2)
+{
+    int ret = -1;
+    json_object *data;
+    char key[100] = "";
+    char ts[11] = "";
+    sprintf(ts, "%lu", stats_p->timestamp);
+    sprintf(key, ".rpt.%s.%lu", uuid, stats_p->timestamp);
+    data = json_object_new_object();
+    json_object_object_add(data, "pkts_rcvd_inb", json_object_new_int64(stats_p->pkts_rcvd_inb));
+    json_object_object_add(data, "pkts_drop_inb", json_object_new_int64(stats_p->pkts_drop_inb));
+    json_object_object_add(data, "pkts_pass_inb", json_object_new_int64(stats_p->pkts_pass_inb));
+    json_object_object_add(data, "bytes_rcvd_inb", json_object_new_int64(stats_p->bytes_rcvd_inb));
+    json_object_object_add(data, "bytes_drop_inb", json_object_new_int64(stats_p->bytes_drop_inb));
+    json_object_object_add(data, "bytes_pass_inb", json_object_new_int64(stats_p->bytes_pass_inb));
+    leveldb_simple_write_data(key, json_object_to_json_string(data), db1);
+    leveldb_simple_write_data(uuid, ts, db2);
+    sf_debug("Writing data to Leveldb: Zone uuid=%s", uuid);
+
+    return ret;
+}
+
+int handle_zone_stats(const char *uuid,
+    struct sflow_flex_kv *kv, int num_counters,
+    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2)
+{
+    int i, len = 0, ret = 0, idx;
+    u32 key;
+    u64 value;
+    stat_zone_t *stats_p = cached_cm_p;
+    unsigned char is_first_cntr = 1;
+    const u32 max_cntr_id = 194; // actual max is 224 but for now we only care for pps/bps counters
+
+    if (stats_p == NULL) {
+        printf("ERROR: handle_zone_stats() no cached stats for zone: %s\n", uuid);
+        return -1;
+    }
+
+    idx = slot_to_index(slot_id);
+    for (i = 0; i < num_counters; i++) {
+        key = ntohl(kv[i].key);
+        value = ntohll(kv[i].value);
+
+        if (is_first_cntr) {
+            if (key > max_cntr_id) {
+                return 0;
+            }
+            is_first_cntr = 0;
+            if (key == stats_p->last_key[idx] + 1) {
+                sf_debug("Zone uuid = %s key last=%u new=%d, expected. ts=%ld\n", uuid, stats_p->last_key[idx], key, tstamp);
+            } else {
+                sf_debug("Zone uuid = %s key last=%u new=%d, UNexpected. ts=%ld\n", uuid, stats_p->last_key[idx], key, tstamp);
+                memset(stats_p, 0, sizeof(stat_zone_t));
+                if (key != 1) {
+                    return -1;
+                }
+            }
+            stats_p->timestamp = tstamp;
+            stats_p->slots |= slot_id;
+        }
+
+        switch(key) {
+            case 14: stats_p->pkts_pass_inb += value;  // zone_pkt_sent
+                sf_debug("Zone PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 73: stats_p->bytes_rcvd_inb += value;  // ingress_bytes
+                sf_debug("Zone PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 75: stats_p->pkts_rcvd_inb += value;  // ingress_packets
+                sf_debug("Zone PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 121: stats_p->bytes_pass_inb += value; // inbound_bytes_sent
+                sf_debug("Zone PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 122: stats_p->bytes_drop_inb += value; // inbound_bytes_drop
+                sf_debug("Zone PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 194: stats_p->pkts_drop_inb += value; // dst_drop
+                sf_debug("Zone PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    stats_p->last_key[idx] = key;
+
+    if ((stats_p->last_key[0] >= max_cntr_id) &&
+        ((slot_id == 0) || (stats_p->last_key[1] >= max_cntr_id))) {
+        ret = send_zone_stats(uuid, stats_p, tags_buf, db1, db2);
+        memset(stats_p, 0, sizeof(stat_zone_t));
+    }
+
+    return ret;
+}
+
+int send_zone_port_http_stats(const char *uuid, cm_stat_http_t *stats_p, 
+        const char *agent_info, int send_pps_bps, int send_cm, leveldb_t *db1, leveldb_t *db2)
+{
+    char buf[2048];
+    int len = 0, ret = -1;
+    json_object *data;
+    char key[100] = "";
+    char ts[11] = "";
+    sprintf(ts, "%lu", stats_p->timestamp);
+    sprintf(key, ".rpt.%s.%lu", uuid, stats_p->timestamp);
+    data = json_object_new_object();
+    if (send_pps_bps) {
+        json_object_object_add(data, "pkts_rcvd", json_object_new_int64(stats_p->pkts_rcvd));
+        json_object_object_add(data, "pkts_drop", json_object_new_int64(stats_p->pkts_drop));
+        json_object_object_add(data, "pkts_pass", json_object_new_int64(stats_p->pkts_pass));
+        json_object_object_add(data, "bytes_rcvd", json_object_new_int64(stats_p->bytes_rcvd));
+        json_object_object_add(data, "bytes_drop", json_object_new_int64(stats_p->bytes_drop));
+        json_object_object_add(data, "bytes_pass", json_object_new_int64(stats_p->bytes_pass));
+    }
+
+    if (send_cm) {
+        json_object_object_add(data, "syn_auth_pass", json_object_new_int64(stats_p->syn_auth_pass));
+        json_object_object_add(data, "http_src_based_glid_drop", json_object_new_int64(stats_p->http_src_based_glid_drop));
+        json_object_object_add(data, "http_blacklist_drop", json_object_new_int64(stats_p->http_blacklist_drop));
+        json_object_object_add(data, "http_tcp_service_drop", json_object_new_int64(stats_p->http_tcp_service_drop));
+        json_object_object_add(data, "http_service_drop", json_object_new_int64(stats_p->http_service_drop));
+        json_object_object_add(data, "http_auth_drop", json_object_new_int64(stats_p->http_auth_drop));
+        json_object_object_add(data, "http_port_glid_drop", json_object_new_int64(stats_p->http_port_glid_drop));
+        json_object_object_add(data, "http_tcp_auth_drop", json_object_new_int64(stats_p->http_tcp_auth_drop));
+    }
+
+    if (send_pps_bps || send_cm) {
+        leveldb_simple_write_data(key, json_object_to_json_string(data), db1);
+        leveldb_simple_write_data(uuid, ts, db2);
+        sf_debug("Writing data to Leveldb: uuid=%s", uuid);
+    }
+    return ret;
+}
+
+int handle_port_http_stats(const char *uuid,
+    struct sflow_flex_kv *kv, int num_counters,
+    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2)
+{
+    int i, len = 0, ret, idx;
+    u32 key;
+    u64 value;
+    cm_stat_http_t *cm_p = cached_cm_p;
+    unsigned char is_first_cntr = 1, send_pps_bps = 0, reset_stats = 0;
+#define MAX_ZONE_PORT_HTTP_OID 254
+    const u32 max_cntr_id = MAX_ZONE_PORT_HTTP_OID;
+
+    if (cm_p == NULL) {
+        printf("ERROR: handle_port_http_stats() no cached countermeasures for service: %s\n", uuid);
+        return -1;
+    }
+
+    idx = slot_to_index(slot_id);
+    for (i = 0; i < num_counters; i++) {
+        key = ntohl(kv[i].key);
+        value = ntohll(kv[i].value);
+
+        if (is_first_cntr) {
+            is_first_cntr = 0;
+            if (key == cm_p->last_key[idx] + 1) {
+                sf_debug("Zone HTTP uuid = %s key last=%u new=%d, expected. ts=%ld\n", uuid, cm_p->last_key[idx], key, tstamp);
+            } else {
+                sf_debug("Zone HTTP uuid = %s key last=%u new=%d, UNexpected. ts=%ld\n", uuid, cm_p->last_key[idx], key, tstamp);
+                memset(cm_p, 0, sizeof(cm_stat_http_t));
+                if (key != 1) {
+                    return -1;
+                }
+            }
+            cm_p->timestamp = tstamp;
+            cm_p->slots |= slot_id;
+        }
+
+        switch(key) {
+            case 107: cm_p->pkts_rcvd += value; // port_rcvd
+                sf_debug("HTTP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                send_pps_bps = 1;
+                break;
+            case 108: cm_p->pkts_drop += value; // port_drop
+                sf_debug("HTTP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 109: cm_p->pkts_pass += value; // port_pkt_sent
+                sf_debug("HTTP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 129: cm_p->bytes_rcvd += value; // port_bytes
+                sf_debug("HTTP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 133: cm_p->bytes_pass += value; // port_bytes_sent
+                sf_debug("HTTP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 134: cm_p->bytes_drop += value; // port_bytes_drop
+                sf_debug("HTTP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 191: cm_p->syn_auth_pass += value; // syn_auth_pass
+                sf_debug("HTTP CM: %lu %s.%u %lu syn_auth_pass %s", tstamp, uuid, key, value, tags_buf);
+                break;
+
+            case 143:  // exceed_drop_prate_src
+            case 144:  // exceed_drop_crate_src
+            case 145:  // exceed_drop_climit_src
+            case 151:  // exceed_drop_brate_src_pkt
+                sf_debug("HTTP CM: %lu %s.%u %lu http_src_based_glid_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->http_src_based_glid_drop += value;
+                break;
+
+            case 176:  // bl
+            case 177:  // src_drop
+                sf_debug("HTTP CM: %lu %s.%u %lu http_blacklist_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->http_blacklist_drop += value;
+                break;
+
+            case 138:  // filter_auth_fail
+            case 139:  // syn_auth_fail
+            case 155:  // ack_retry_gap_drop
+            case 156:  // conn_prate_excd
+            case 157:  // out_of_seq_excd
+            case 158:  // retransmit_excd
+            case 159:  // zero_window_excd
+            case 161:  // syn_retry_gap_drop
+            case 165:  // tcp_filter_action_drop
+            case 194:  // syn_retry_failed
+            case 226:  // conn_ofo_rate_excd
+            case 227:  // conn_rexmit_rate_excd
+            case 228:  // conn_zwindow_rate_excd
+                sf_debug("HTTP CM: %lu %s.%u %lu http_tcp_service_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->http_tcp_service_drop += value;
+                break;
+
+            case 40:  // policy_violation
+            case 41:  // less_than_mss_exceed
+            case 46:  // policy_drop
+            case 66:  // window_small_drop
+                sf_debug("HTTP CM: %lu %s.%u %lu http_service_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->http_service_drop += value;
+                break;
+
+            case 174:  // http_auth_drop
+            case 251:  // src_http_auth_drop
+                sf_debug("HTTP CM: %lu %s.%u %lu http_auth_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->http_auth_drop += value;
+                break;
+
+            case 110: // port_pkt_rate_exceed
+            case 112: // port_conn_rate_exceed
+            case 113: // port_conn_limm_exceed
+            case 152: // port_kbit_rate_exceed_pkt
+                sf_debug("HTTP CM: %lu %s.%u %lu http_port_glid_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->http_port_glid_drop += value;
+                break;
+
+            case 172:  // tcp_auth_drop
+            case 252:  // src_auth_drop
+                sf_debug("HTTP CM: %lu %s.%u %lu http_tcp_auth_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->http_tcp_auth_drop += value;
+                break;
+            default:
+                sf_debug("HTTP --: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+        }
+
+    }
+
+    cm_p->last_key[idx] = key;
+
+    if ((cm_p->last_key[0] >= max_cntr_id) &&
+        ((slot_id == 0) || (cm_p->last_key[1] >= max_cntr_id))) {
+        ret = send_zone_port_http_stats(uuid, cm_p, tags_buf, 1, 1, db1, db2);
+        memset(cm_p, 0, sizeof(cm_stat_http_t));
+    }
+    return ret;
+}
+
+int send_zone_port_ssll4_stats(const char *uuid, cm_stat_ssll4_t *stats_p, 
+        const char *agent_info, int send_pps_bps, int send_cm, leveldb_t *db1, leveldb_t *db2)
+{
+    char buf[2048];
+    int len = 0, ret = -1;
+    json_object *data;
+    char ts[11] = "";
+    sprintf(ts, "%lu", stats_p->timestamp);
+    char key[100] = "";
+    sprintf(key, ".rpt.%s.%lu", uuid, stats_p->timestamp);
+    data = json_object_new_object();
+   
+    if (send_pps_bps) {
+        json_object_object_add(data, "pkts_rcvd", json_object_new_int64(stats_p->pkts_rcvd));
+        json_object_object_add(data, "pkts_drop", json_object_new_int64(stats_p->pkts_drop));
+        json_object_object_add(data, "pkts_pass", json_object_new_int64(stats_p->pkts_pass));
+        json_object_object_add(data, "bytes_rcvd", json_object_new_int64(stats_p->bytes_rcvd));
+        json_object_object_add(data, "bytes_drop", json_object_new_int64(stats_p->bytes_drop));
+        json_object_object_add(data, "bytes_pass", json_object_new_int64(stats_p->bytes_pass));
+    }
+
+
+    if (send_cm) {
+        json_object_object_add(data, "syn_auth_pass", json_object_new_int64(stats_p->syn_auth_pass));
+        json_object_object_add(data, "ssll4_src_based_glid_drop", json_object_new_int64(stats_p->ssll4_src_based_glid_drop));
+        json_object_object_add(data, "ssll4_blacklist_drop", json_object_new_int64(stats_p->ssll4_blacklist_drop));
+        json_object_object_add(data, "ssll4_tcp_service_drop", json_object_new_int64(stats_p->ssll4_tcp_service_drop));
+        json_object_object_add(data, "ssll4_service_drop", json_object_new_int64(stats_p->ssll4_service_drop));
+        json_object_object_add(data, "ssll4_auth_drop", json_object_new_int64(stats_p->ssll4_auth_drop));
+        json_object_object_add(data, "ssll4_port_glid_drop", json_object_new_int64(stats_p->ssll4_port_glid_drop));
+        json_object_object_add(data, "ssll4_tcp_auth_drop", json_object_new_int64(stats_p->ssll4_tcp_auth_drop));
+    }
+
+    if (send_pps_bps || send_cm) {
+        leveldb_simple_write_data(key, json_object_to_json_string(data), db1);
+        leveldb_simple_write_data(uuid, ts, db2);
+        sf_debug("Writing data to Leveldb: uuid=%s", uuid);
+    }
+    return ret;
+}
+
+int handle_port_ssll4_stats(const char *uuid,
+    struct sflow_flex_kv *kv, int num_counters,
+    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2)
+{
+    int i, len = 0, ret, idx;
+    u32 key;
+    u64 value;
+    cm_stat_ssll4_t *cm_p = cached_cm_p;
+    unsigned char is_first_cntr = 1, send_pps_bps = 0, reset_stats = 0;
+#define MAX_ZONE_PORT_SSLL4_OID 148
+    const u32 max_cntr_id = MAX_ZONE_PORT_SSLL4_OID;
+
+    if (cm_p == NULL) {
+        printf("ERROR: handle_port_ssll4_stats() no cached countermeasures for service: %s\n", uuid);
+        return -1;
+    }
+
+    idx = slot_to_index(slot_id);
+    for (i = 0; i < num_counters; i++) {
+        key = ntohl(kv[i].key);
+        value = ntohll(kv[i].value);
+
+        if (is_first_cntr) {
+            is_first_cntr = 0;
+            if (key == cm_p->last_key[idx] + 1) {
+                sf_debug("Zone SSLL4 uuid = %s key last=%u new=%d, expected. ts=%ld\n", uuid, cm_p->last_key[idx], key, tstamp);
+            } else {
+                sf_debug("Zone SSLL4 uuid = %s key last=%u new=%d, UNexpected. ts=%ld\n", uuid, cm_p->last_key[idx], key, tstamp);
+                memset(cm_p, 0, sizeof(cm_stat_ssll4_t));
+                if (key != 1) {
+                    return -1;
+                }
+            }
+            cm_p->timestamp = tstamp;
+            cm_p->slots |= slot_id;
+        }
+
+        switch(key) {
+            case 20: cm_p->pkts_rcvd += value;  // port_rcvd
+                sf_debug("SSL PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                send_pps_bps = 1;
+                break;
+            case 21: cm_p->pkts_drop += value;  // port_drop
+                sf_debug("SSL PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 22: cm_p->pkts_pass += value;  // port_pkt_sent
+                sf_debug("SSL PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 27: cm_p->bytes_rcvd += value;  // port_bytes
+                sf_debug("SSL PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 31: cm_p->bytes_pass += value;  // port_bytes_sent
+                sf_debug("SSL PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 32: cm_p->bytes_drop += value;  // port_bytes_drop
+                sf_debug("SSL PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 88: cm_p->syn_auth_pass += value;  // syn_auth_pass
+                sf_debug("SSL PB: %lu %s.%u %lu syn_auth_pass %s", tstamp, uuid, key, value, tags_buf);
+                break;
+
+            case 33:   // port_src_bl
+            case 73:   // bl
+                sf_debug("SSL CM: %lu %s.%u %lu ssll4_blacklist_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->ssll4_blacklist_drop += value;
+                break;
+
+            case 45:   // exceed_drop_prate_src
+            case 46:   // exceed_drop_crate_src
+            case 47:   // exceed_drop_climit_src
+            case 52:   // exceed_drop_brate_src_pkt
+                sf_debug("SSL CM: %lu %s.%u %lu ssll4_src_based_glid_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->ssll4_src_based_glid_drop += value;
+                break;
+
+            case 17:   // auth_handshake_timeout
+            case 71:   // ssl_auth_drop
+            case 145:  // src_ssl_auth_drop
+                sf_debug("SSL CM: %lu %s.%u %lu ssll4_auth_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->ssll4_auth_drop += value;
+                break;
+
+            case 120:  // conn_ofo_rate_excd
+            case 121:  // conn_rexmit_rate_excd
+            case 122:  // conn_zwindow_rate_excd
+            case 56:   // ack_retry_gap_drop
+            case 57:   // conn_prate_excd
+            case 58:   // out_of_seq_excd
+            case 59:   // retransmit_excd
+            case 60:   // zero_window_excd
+            case 62:   // syn_retry_gap_drop
+            case 91:   // syn_retry_failed
+            case 42:   // filter_action_drop
+                sf_debug("SSL CM: %lu %s.%u %lu ssll4_tcp_service_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->ssll4_tcp_service_drop += value;
+                break;
+
+            case 1:    // policy_reset
+            case 2:    // policy_drop
+            case 3:    // drop_packet
+                sf_debug("SSL CM: %lu %s.%u %lu ssll4_service_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->ssll4_service_drop += value;
+                break;
+
+            case 23:   // port_pkt_rate_exceed
+            case 25:   // port_conn_rate_exceed
+            case 26:   // port_conn_limm_exceed
+            case 53:   // port_kbit_rate_exceed_pkt
+                sf_debug("SSL CM: %lu %s.%u %lu ssll4_port_glid_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->ssll4_port_glid_drop += value;
+                break;
+
+            case 69:   // tcp_auth_drop
+            case 146:  // src_auth_drop (tcp)
+                sf_debug("SSL CM: %lu %s.%u %lu ssll4_tcp_auth_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->ssll4_tcp_auth_drop += value;
+                break;
+            default:
+                sf_debug("SSL --: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+        }
+    }
+
+    cm_p->last_key[idx] = key;
+
+    if ((cm_p->last_key[0] >= max_cntr_id) &&
+        ((slot_id == 0) || (cm_p->last_key[1] >= max_cntr_id))) {
+        ret = send_zone_port_ssll4_stats(uuid, cm_p, tags_buf, 1, 1, db1, db2);
+        memset(cm_p, 0, sizeof(cm_stat_ssll4_t));
+    }
+    return ret;
+}
+
+int send_zone_port_dnstcp_stats(const char *uuid, cm_stat_dnstcp_t *stats_p, 
+        const char *agent_info, int send_pps_bps, int send_cm, leveldb_t *db1, leveldb_t *db2)
+{
+    char buf[2048];
+    int len = 0, ret = -1;
+    json_object *data;
+    char ts[11] = "";
+    sprintf(ts, "%lu", stats_p->timestamp);
+    char key[100] = "";
+    sprintf(key, ".rpt.%s.%lu", uuid, stats_p->timestamp);
+    data = json_object_new_object();   
+    if (send_pps_bps) {
+        json_object_object_add(data, "pkts_rcvd", json_object_new_int64(stats_p->pkts_rcvd));
+        json_object_object_add(data, "pkts_drop", json_object_new_int64(stats_p->pkts_drop));
+        json_object_object_add(data, "pkts_pass", json_object_new_int64(stats_p->pkts_pass));
+        json_object_object_add(data, "bytes_rcvd", json_object_new_int64(stats_p->bytes_rcvd));
+        json_object_object_add(data, "bytes_drop", json_object_new_int64(stats_p->bytes_drop));
+        json_object_object_add(data, "bytes_pass", json_object_new_int64(stats_p->bytes_pass));
+    }
+
+    if (send_cm) {
+        json_object_object_add(data, "dnstcp_src_based_glid_drop", json_object_new_int64(stats_p->dnstcp_src_based_glid_drop));
+        json_object_object_add(data, "dnstcp_blacklist_drop", json_object_new_int64(stats_p->dnstcp_blacklist_drop));
+        json_object_object_add(data, "dnstcp_service_drop", json_object_new_int64(stats_p->dnstcp_service_drop));
+        json_object_object_add(data, "dnstcp_port_glid_drop", json_object_new_int64(stats_p->dnstcp_port_glid_drop));
+    }
+
+    if (send_pps_bps || send_cm) {
+        leveldb_simple_write_data(key, json_object_to_json_string(data), db1);
+        leveldb_simple_write_data(uuid, ts, db2);
+        sf_debug("Writing data to Leveldb: uuid=%s", uuid);
+    }
+    return ret;
+}
+
+int handle_port_dnstcp_stats(const char *uuid,
+    struct sflow_flex_kv *kv, int num_counters,
+    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2)
+{
+    int i, len = 0, ret, idx;
+    u32 key;
+    u64 value;
+    cm_stat_dnstcp_t *cm_p = cached_cm_p;
+    unsigned char is_first_cntr = 1, send_pps_bps = 0, reset_stats = 0;
+#define MAX_ZONE_PORT_DNSTCP_OID 177
+    const u32 max_cntr_id = MAX_ZONE_PORT_DNSTCP_OID;
+
+    if (cm_p == NULL) {
+        printf("ERROR: handle_port_dnstcp_stats() no cached countermeasures for service: %s\n", uuid);
+        return -1;
+    }
+
+    idx = slot_to_index(slot_id);
+    for (i = 0; i < num_counters; i++) {
+        key = ntohl(kv[i].key);
+        value = ntohll(kv[i].value);
+
+        if (is_first_cntr) {
+            is_first_cntr = 0;
+            if (key == cm_p->last_key[idx] + 1) {
+                sf_debug("Zone DNSTCP uuid = %s key last=%u new=%d, expected. ts=%ld\n", uuid, cm_p->last_key[idx], key, tstamp);
+            } else {
+                sf_debug("Zone DNSTCP uuid = %s key last=%u new=%d, UNexpected. ts=%ld\n", uuid, cm_p->last_key[idx], key, tstamp);
+                memset(cm_p, 0, sizeof(cm_stat_dnstcp_t));
+                if (key != 1) {
+                    return -1;
+                }
+            }
+            cm_p->timestamp = tstamp;
+            cm_p->slots |= slot_id;
+        }
+
+        switch(key) {
+            case 25: cm_p->pkts_rcvd += value; // port_rcvd
+                sf_debug("DNST PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                send_pps_bps = 1;
+                break;
+            case 26: cm_p->pkts_drop += value; // port_drop
+                sf_debug("DNST PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 27: cm_p->pkts_pass += value; // port_pkt_sent
+                sf_debug("DNST PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 35: cm_p->bytes_rcvd += value; // port_bytes
+                sf_debug("DNST PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 39: cm_p->bytes_pass += value; // port_bytes_sent
+                sf_debug("DNST PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 40: cm_p->bytes_drop += value; // port_bytes_drop
+                sf_debug("DNST PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+
+            case 53:   // exceed_drop_prate_src
+            case 54:   // exceed_drop_crate_src
+            case 55:   // exceed_drop_climit_src
+            case 65:   // exceed_drop_brate_src_pkt
+                sf_debug("DNST CM: %lu %s.%u %lu dnstcp_src_based_glid_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->dnstcp_src_based_glid_drop += value;
+                break;
+
+            case 87:   // tcp_auth_drop
+            case 50:   // filter_action_drop
+            case 70:   // conn_prate_excd
+            case 80:   // policy_drop
+            case 82:   // rrtype_drop
+            case 173:  // query_type_any_drop
+            case 174:  // src_query_type_any_drop
+            case 81:   // fqdn_label_count_exceed
+            case 85:   // src_fqdn_label_count_exceed
+            case 1:    // rate_limit_type0
+            case 2:    // rate_limit_type1
+            case 3:    // rate_limit_type2
+            case 4:    // rate_limit_type3
+            case 5:    // rate_limit_type4
+            case 8:    // nxdomain_bl_drop
+            case 9:    // fqdn_label_len_exceed
+            case 10:   // malform_drop
+            case 11:   // fqdn_stage_2_rate_exceed
+            case 60:   // src_rate_limit_type0
+            case 61:   // src_rate_limit_type1
+            case 62:   // src_rate_limit_type2
+            case 63:   // src_rate_limit_type3
+            case 64:   // src_rate_limit_type4
+            case 79:   // fqdn_rate_by_label_count_exceed
+            case 142:  // nxdomain_drop
+                sf_debug("DNST CM: %lu %s.%u %lu dnstcp_service_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->dnstcp_service_drop += value;
+                break;
+
+            case 28:   // port_pkt_rate_exceed
+            case 30:   // port_conn_rate_exceed
+            case 31:   // port_conn_limm_exceed
+            case 66:   // port_kbit_rate_exceed_pkt
+                sf_debug("DNST CM: %lu %s.%u %lu dnstcp_port_glid_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->dnstcp_port_glid_drop += value;
+                break;
+
+            case 41:   // port_src_bl
+            case 49:   // filter_action_blacklist
+            case 96:   // bl
+            case 137:  // src_filter_action_blacklist
+            case 146:  // tcp_rexmit_syn_limit_bl
+                sf_debug("DNST CM: %lu %s.%u %lu dnstcp_blacklist_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->dnstcp_blacklist_drop += value;
+                break;
+            default:
+                sf_debug("DNST --: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+        }
+    }
+
+    cm_p->last_key[idx] = key;
+
+    if ((cm_p->last_key[0] >= max_cntr_id) &&
+        ((slot_id == 0) || (cm_p->last_key[1] >= max_cntr_id))) {
+        ret = send_zone_port_dnstcp_stats(uuid, cm_p, tags_buf, 1, 1, db1, db2);
+        memset(cm_p, 0, sizeof(cm_stat_dnstcp_t));
+    }
+
+    return ret;
+}
+
+int send_zone_port_dnsudp_stats(const char *uuid, cm_stat_dnsudp_t *stats_p, 
+        const char *agent_info, int send_pps_bps, int send_cm, leveldb_t *db1, leveldb_t *db2)
+{
+    char buf[2048];
+    int len = 0, ret = -1;
+    json_object *data;
+    char ts[11] = "";
+    sprintf(ts, "%lu", stats_p->timestamp);
+    char key[100] = "";
+    sprintf(key, ".rpt.%s.%lu", uuid, stats_p->timestamp);
+    data = json_object_new_object();
+   
+    if (send_pps_bps) {
+        json_object_object_add(data, "pkts_rcvd", json_object_new_int64(stats_p->pkts_rcvd));
+        json_object_object_add(data, "pkts_drop", json_object_new_int64(stats_p->pkts_drop));
+        json_object_object_add(data, "pkts_pass", json_object_new_int64(stats_p->pkts_pass));
+        json_object_object_add(data, "bytes_rcvd", json_object_new_int64(stats_p->bytes_rcvd));
+        json_object_object_add(data, "bytes_drop", json_object_new_int64(stats_p->bytes_drop));
+        json_object_object_add(data, "bytes_pass", json_object_new_int64(stats_p->bytes_pass));
+    }
+
+    if (send_cm) {
+        json_object_object_add(data, "udp_auth_pass", json_object_new_int64(stats_p->udp_auth_pass));
+        json_object_object_add(data, "dnsudp_src_based_glid_drop", json_object_new_int64(stats_p->dnsudp_src_based_glid_drop));
+        json_object_object_add(data, "dnsudp_blacklist_drop", json_object_new_int64(stats_p->dnsudp_blacklist_drop));
+        json_object_object_add(data, "dnsudp_service_drop", json_object_new_int64(stats_p->dnsudp_service_drop));
+        json_object_object_add(data, "dnsudp_service_drop", json_object_new_int64(stats_p->dnsudp_service_drop));
+        json_object_object_add(data, "dnsudp_auth_drop", json_object_new_int64(stats_p->dnsudp_auth_drop));
+        json_object_object_add(data, "dnsudp_port_glid_drop", json_object_new_int64(stats_p->dnsudp_port_glid_drop));
+    }
+
+    if (send_pps_bps || send_cm) {
+        leveldb_simple_write_data(key, json_object_to_json_string(data), db1);
+        leveldb_simple_write_data(uuid, ts, db2);
+        sf_debug("Writing data to Leveldb: uuid=%s", uuid);
+    }
+    return ret;
+}
+
+int handle_port_dnsudp_stats(const char *uuid,
+    struct sflow_flex_kv *kv, int num_counters,
+    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2)
+{
+    int i, len = 0, ret, idx;
+    u32 key;
+    u64 value;
+    cm_stat_dnsudp_t *cm_p = cached_cm_p;
+    unsigned char is_first_cntr = 1, send_pps_bps = 0, reset_stats = 0;
+#define MAX_ZONE_PORT_DNSUDP_OID 138
+    const u32 max_cntr_id = MAX_ZONE_PORT_DNSUDP_OID;
+
+    if (cm_p == NULL) {
+        printf("ERROR: handle_port_dnsudp_stats() no cached countermeasures for service: %s\n", uuid);
+        return -1;
+    }
+
+    idx = slot_to_index(slot_id);
+    for (i = 0; i < num_counters; i++) {
+        key = ntohl(kv[i].key);
+        value = ntohll(kv[i].value);
+
+        if (is_first_cntr) {
+            is_first_cntr = 0;
+            if (key == cm_p->last_key[idx] + 1) {
+                sf_debug("Zone DNSUDP uuid = %s key last=%u new=%d, expected. ts=%ld\n", uuid, cm_p->last_key[idx], key, tstamp);
+            } else {
+                sf_debug("Zone DNSUDP uuid = %s key last=%u new=%d, UNexpected. ts=%ld\n", uuid, cm_p->last_key[idx], key, tstamp);
+                memset(cm_p, 0, sizeof(cm_stat_dnsudp_t));
+                if (key != 1) {
+                    return -1;
+                }
+            }
+            cm_p->timestamp = tstamp;
+            cm_p->slots |= slot_id;
+        }
+
+        switch(key) {
+            case 27: cm_p->pkts_rcvd += value; // port_rcvd
+                sf_debug("DNSU PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                send_pps_bps = 1;
+                break;
+            case 28: cm_p->pkts_drop += value; // port_drop
+                sf_debug("DNSU PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 29: cm_p->pkts_pass += value; // port_pkt_sent
+                sf_debug("DNSU PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 37: cm_p->bytes_rcvd += value; // port_bytes
+                sf_debug("DNSU PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 41: cm_p->bytes_pass += value; // port_bytes_sent
+                sf_debug("DNSU PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 42: cm_p->bytes_drop += value; // port_bytes_drop
+                sf_debug("DNSU PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 2:  cm_p->udp_auth_pass += value; // udp_auth_pass
+                sf_debug("DNSU PB: %lu %s.%u %lu udp_auth_pass %s", tstamp, uuid, key, value, tags_buf);
+                break;
+
+            case 53:   // exceed_drop_prate_src
+            case 54:   // exceed_drop_crate_src
+            case 55:   // exceed_drop_climit_src
+            case 66:   // exceed_drop_brate_src_pkta
+                sf_debug("DNSU CM: %lu %s.%u %lu dnsudp_src_based_glid_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->dnsudp_src_based_glid_drop += value;
+                break;
+
+            case 46:   // filter_auth_fail
+            case 49:   // filter_action_blacklist
+            case 50:   // filter_action_drop
+            case 69:   // conn_prate_excd
+            case 73:   // payload_too_small
+            case 74:   // payload_too_big
+            case 72:   // wellknown_sport_drop
+            case 12:   // malform_drop
+            case 3:    // rate_limit_type0
+            case 4:    // rate_limit_type1
+            case 5:    // rate_limit_type2
+            case 6:    // rate_limit_type3
+            case 7:    // rate_limit_type4
+            case 8:    // nxdomain_bl_drop
+            case 10:   // nxdomain_drop
+            case 70:   // ntp_monlist_req
+            case 79:   // rrtype_drop
+            case 133:  // query_type_any_drop
+            case 134:  // src_query_type_any_drop
+            case 78:   // fqdn_label_count_exceed
+            case 81:   // src_fqdn_label_count_exceed
+            case 76:   // fqdn_rate_by_label_count_exceed
+            case 13:   // fqdn_stage_2_rate_exceed
+            case 17:   // fqdn_label_len_exceed
+            case 61:   // src_rate_limit_type0
+            case 62:   // src_rate_limit_type1
+            case 63:   // src_rate_limit_type2
+            case 64:   // src_rate_limit_type3
+            case 65:   // src_rate_limit_type4
+                sf_debug("DNSU CM: %lu %s.%u %lu dnsudp_service_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->dnsudp_service_drop += value;
+                break;
+
+            case 86:   // udp_auth_drop
+            case 87:   // dns_auth_drop
+            case 135:  // src_udp_auth_drop
+            case 136:  // src_dns_auth_drop
+                sf_debug("DNSU CM: %lu %s.%u %lu dnsudp_auth_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->dnsudp_auth_drop += value;
+                break;
+
+            case 30:   // port_pkt_rate_exceed
+            case 32:   // port_conn_rate_exceed
+            case 33:   // port_conn_limm_exceed
+            case 67:   // port_kbit_rate_exceed_pkt
+                sf_debug("DNSU CM: %lu %s.%u %lu dnsudp_port_glid_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->dnsudp_port_glid_drop += value;
+                break;
+
+            case 43:   // port_src_bl
+            case 116:  // src_conn_pkt_rate_excd
+            case 119:  // src_filter_action_drop
+                sf_debug("DNSU CM: %lu %s.%u %lu dnsudp_blacklist_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->dnsudp_blacklist_drop += value;
+                break;
+            default:
+                sf_debug("DNSU --: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+        }
+    }
+
+    cm_p->last_key[idx] = key;
+
+    if ((cm_p->last_key[0] >= max_cntr_id) &&
+        ((slot_id == 0) || (cm_p->last_key[1] >= max_cntr_id))) {
+        ret = send_zone_port_dnsudp_stats(uuid, cm_p, tags_buf, 1, 1, db1, db2);
+        memset(cm_p, 0, sizeof(cm_stat_dnsudp_t));
+    }
+    return ret;
+}
+
+int send_zone_port_tcp_stats(const char *uuid, cm_stat_tcp_t *stats_p, 
+        u32 schema_oid, const char *agent_info, int send_pps_bps, int send_cm, leveldb_t *db1, leveldb_t *db2)
+{
+    char buf[2048];
+    int len = 0, ret;
+    json_object *data;
+    char ts[11] = "";
+    sprintf(ts, "%lu", stats_p->timestamp);
+    char key[100] = "";
+    sprintf(key, ".rpt.%s.%lu", uuid, stats_p->timestamp);
+    data = json_object_new_object();
+
+    if (send_pps_bps) {
+        json_object_object_add(data, "pkts_rcvd", json_object_new_int64(stats_p->pkts_rcvd));
+        json_object_object_add(data, "pkts_drop", json_object_new_int64(stats_p->pkts_drop));
+        json_object_object_add(data, "pkts_pass", json_object_new_int64(stats_p->pkts_pass));
+        json_object_object_add(data, "bytes_rcvd", json_object_new_int64(stats_p->bytes_rcvd));
+        json_object_object_add(data, "bytes_drop", json_object_new_int64(stats_p->bytes_drop));
+        json_object_object_add(data, "bytes_pass", json_object_new_int64(stats_p->bytes_pass));
+    }
+ 
+    if (send_cm) {
+        json_object_object_add(data, "syn_auth_pass", json_object_new_int64(stats_p->syn_auth_pass));
+        json_object_object_add(data, "tcp_src_based_glid_drop", json_object_new_int64(stats_p->tcp_src_based_glid_drop));
+        json_object_object_add(data, "tcp_blacklist_drop", json_object_new_int64(stats_p->tcp_blacklist_drop));
+        json_object_object_add(data, "tcp_service_drop", json_object_new_int64(stats_p->tcp_service_drop));
+        json_object_object_add(data, "tcp_auth_drop", json_object_new_int64(stats_p->tcp_auth_drop));
+        json_object_object_add(data, "tcp_port_glid_drop", json_object_new_int64(stats_p->tcp_port_glid_drop));
+    }
+
+    if (send_pps_bps || send_cm) {
+        leveldb_simple_write_data(key, json_object_to_json_string(data), db1);
+        leveldb_simple_write_data(uuid, ts, db2);
+        sf_debug("Writing data to Leveldb: uuid=%s", uuid);
+    }
+
+    return ret;
+}
+
+int handle_port_tcp_stats(const char *uuid,
+    struct sflow_flex_kv *kv, int num_counters,
+    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2)
+{
+    int i, len = 0, ret, idx;
+    u32 key;
+    u64 value;
+    cm_stat_tcp_t *cm_p = cached_cm_p;
+    unsigned char is_first_cntr = 1, send_pps_bps = 0, reset_stats = 0;
+#define MAX_ZONE_PORT_TCP_OID 122
+    const u32 max_cntr_id = MAX_ZONE_PORT_TCP_OID;
+
+    if (cm_p == NULL) {
+        printf("ERROR: handle_port_tcp_stats() no cached countermeasures for service: %s\n", uuid);
+        return -1;
+    }
+
+    idx = slot_to_index(slot_id);
+    for (i = 0; i < num_counters; i++) {
+        key = ntohl(kv[i].key);
+        value = ntohll(kv[i].value);
+
+        if (is_first_cntr) {
+            is_first_cntr = 0;
+            if (key == cm_p->last_key[idx] + 1) {
+                sf_debug("Zone TCP uuid = %s key last=%u new=%d, expected. ts=%ld\n", uuid, cm_p->last_key[idx], key, tstamp);
+            } else {
+                sf_debug("Zone TCP uuid = %s key last=%u new=%d, UNexpected. ts=%ld\n", uuid, cm_p->last_key[idx], key, tstamp);
+                memset(cm_p, 0, sizeof(cm_stat_tcp_t));
+                if (key != 1) {
+                    return -1;
+                }
+            }
+            cm_p->timestamp = tstamp;
+            cm_p->slots |= slot_id;
+        }
+
+        switch(key) {
+            case 7:  cm_p->pkts_rcvd += value;  // port_rcvd
+                sf_debug("TCP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                send_pps_bps = 1;
+                break;
+            case 8:  cm_p->pkts_drop += value;  // port_drop
+                sf_debug("TCP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 9:  cm_p->pkts_pass += value;  // port_pkt_sent
+                sf_debug("TCP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 18: cm_p->bytes_rcvd += value; // port_bytes
+                sf_debug("TCP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 22: cm_p->bytes_pass += value; // port_bytes_sent
+                sf_debug("TCP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 23: cm_p->bytes_drop += value; // port_bytes_drop
+                sf_debug("TCP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 39: cm_p->syn_auth_pass += value; // syn_auth_pass
+                sf_debug("TCP PB: %lu %s.%u %lu syn_auth_pass %s", tstamp, uuid, key, value, tags_buf);
+                break;
+
+            case 10:   // port_pkt_rate_exceed
+            case 12:   // port_conn_rate_exceed
+            case 13:   // port_conn_limm_exceed
+            case 41:   // port_kbit_rate_exceed_pkt
+                sf_debug("TCP CM: %lu %s.%u %lu tcp_port_glid_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->tcp_port_glid_drop += value;
+                break;
+
+            case 24:   // port_src_bl
+            case 28:   // filter_action_blacklist
+            case 53:   // bl
+            case 89:   // src_filter_action_blacklist
+            case 94:   // tcp_rexmit_syn_limit_bl
+                sf_debug("TCP CM: %lu %s.%u %lu tcp_blacklist_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->tcp_blacklist_drop += value;
+                break;
+
+            case 68:   // auth_drop
+            case 120:  // src_auth_drop
+                sf_debug("TCP CM: %lu %s.%u %lu tcp_auth_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->tcp_auth_drop += value;
+                break;
+
+            case 14:   // filter_auth_fail
+            case 29:   // filter_action_drop
+            case 45:   // conn_prate_excd
+            case 46:   // out_of_seq_excd
+            case 47:   // retransmit_excd
+            case 48:   // zero_window_excd
+            case 50:   // syn_retry_gap_drop
+            case 72:   // syn_retry_failed
+            case 95:   // conn_ofo_rate_excd
+            case 96:   // conn_rexmit_rate_excd
+            case 97:   // conn_zwindow_rate_excd
+                sf_debug("TCP CM: %lu %s.%u %lu tcp_service_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->tcp_service_drop += value;
+                break;
+
+            case 32:   // exceed_drop_prate_src
+            case 33:   // exceed_drop_crate_src
+            case 34:   // exceed_drop_climit_src
+            case 40:   // exceed_drop_brate_src_pkt
+                sf_debug("TCP CM: %lu %s.%u %lu tcp_src_based_glid_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->tcp_src_based_glid_drop += value;
+                break;
+            default:
+                sf_debug("TCP --: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+        }
+
+    }
+ 
+    cm_p->last_key[idx] = key;
+
+    if ((cm_p->last_key[0] >= max_cntr_id) &&
+        ((slot_id == 0) || (cm_p->last_key[1] >= max_cntr_id))) {
+        ret = send_zone_port_tcp_stats(uuid, cm_p, STAT_OBJ_ID_PORT_TCP, tags_buf, 1, 1, db1, db2);
+        memset(cm_p, 0, sizeof(cm_stat_tcp_t));
+    }
+
+    return ret;
+}
+
+int handle_port_udp_stats(const char *uuid,
+    struct sflow_flex_kv *kv, int num_counters,
+    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2)
+{
+    int i, len = 0, ret, idx;
+    u32 key;
+    u64 value;
+    cm_stat_udp_t *cm_p = cached_cm_p;
+    unsigned char is_first_cntr = 1;
+    const u32 max_cntr_id = 75;
+
+    if (cm_p == NULL) {
+        printf("ERROR: handle_port_udp_stats() no cached CM stats for service: %s\n", uuid);
+        return -1;
+    }
+
+    idx = slot_to_index(slot_id);
+    for (i = 0; i < num_counters; i++) {
+        key = ntohl(kv[i].key);
+        value = ntohll(kv[i].value);
+
+        if (is_first_cntr) {
+            is_first_cntr = 0;
+            if (key == cm_p->last_key[idx] + 1) {
+                sf_debug("Zone UDP uuid = %s key last=%u new=%d, expected. ts=%ld\n", uuid, cm_p->last_key[idx], key, tstamp);
+            } else {
+                sf_debug("Zone UDP uuid = %s key last=%u new=%d, UNexpected. ts=%ld\n", uuid, cm_p->last_key[idx], key, tstamp);
+                memset(cm_p, 0, sizeof(cm_stat_udp_t));
+                if (key != 1) {
+                    return -1;
+                }
+            }
+            cm_p->timestamp = tstamp;
+            cm_p->slots |= slot_id;
+        }
+
+        switch(key) {
+            case 7: cm_p->pkts_rcvd += value;  // port_rcvd
+                sf_debug("UDP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 8: cm_p->pkts_drop += value;  // port_drop
+                sf_debug("UDP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 9: cm_p->pkts_pass += value;  // port_pkt_sent
+                sf_debug("UDP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 16: cm_p->bytes_rcvd += value; // port_bytes
+                sf_debug("UDP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 20: cm_p->bytes_pass += value; // port_bytes_sent
+                sf_debug("UDP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+            case 21: cm_p->bytes_drop += value; // port_bytes_drop
+                sf_debug("UDP PB: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+
+            case 32:   // exceed_drop_prate_src
+            case 33:   // exceed_drop_crate_src
+            case 34:   // exceed_drop_climit_src
+            case 39:   // exceed_drop_brate_src_pkt
+                sf_debug("UDP CM: %lu %s.%u %lu udp_src_based_glid_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->udp_src_based_glid_drop += value;
+                break;
+
+            case 10:   // port_pkt_rate_exceed
+            case 12:   // port_conn_rate_exceed
+            case 13:   // port_conn_limm_exceed
+            case 40:   // port_kbit_rate_exceed_pkt
+                sf_debug("UDP CM: %lu %s.%u %lu udp_port_glid_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->udp_port_glid_drop += value;
+                break;
+
+            case 22:   // port_src_bl
+            case 61:   // src_conn_pkt_rate_excd
+            case 64:   // src_filter_action_drop
+                sf_debug("UDP CM: %lu %s.%u %lu udp_blacklist_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->udp_blacklist_drop += value;
+                break;
+
+            case 14:   // filter_auth_fail
+            case 26:   // payload_too_small
+            case 27:   // payload_too_big
+            case 28:   // filter_action_blacklist
+            case 29:   // filter_action_drop
+            case 42:   // conn_prate_excd
+            case 43:   // ntp_monlist_req
+            case 45:   // wellknown_sport_drop
+                sf_debug("UDP CM: %lu %s.%u %lu udp_service_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->udp_service_drop += value;
+                break;
+
+            case 46:   // udp_auth_drop
+            case 73:   // src_udp_auth_drop
+                sf_debug("UDP CM: %lu %s.%u %lu udp_auth_drop %s", tstamp, uuid, key, value, tags_buf);
+                cm_p->udp_auth_drop += value;
+                break;
+            default:
+                sf_debug("UDP --: %lu %s.%u %lu %s", tstamp, uuid, key, value, tags_buf);
+                break;
+        }
+
+    }
+
+    cm_p->last_key[idx] = key;
+
+    if ((cm_p->last_key[0] >= max_cntr_id) &&
+        ((slot_id == 0) || (cm_p->last_key[1] >= max_cntr_id))) {
+        //ret = send_cm_stat_to_tsdb(uuid, cm_p, STAT_OBJ_ID_PORT_UDP, tags_buf, db1, db2);
+        memset(cm_p, 0, sizeof(cm_stat_udp_t));
+    }
+    return ret;
+}
+                    
+static void *get_cm_stat_struct(const char *uuid, u32 schema_oid, int *new_uuid)
+{
+    void *cm_p;
+    static int srv_tcp=0, srv_udp=0, srv_http=0, srv_ssl=0, srv_dnstcp=0, srv_dnsudp=0, srv_proto_other=0, srv_icmp=0;
+    static int device=0, zone=0, dst_ent=0, zs_ind=0;
+
+    cm_p = sht_find_with_str(uuidtable, uuid);
+    if (cm_p != NULL) {
+        printf("Found CM struct in hashtable for UUID %s\n", uuid);
+        return cm_p;
+    } else {
+        printf("UUID %s does not exist in hashtable\n", uuid);
+        switch (schema_oid) {
+            /*case STAT_OBJ_ID_DEVICE_DDOS_BRIEF:
+                cm_p = malloc(sizeof(stat_device_ddos_brief_t));
+                memset(cm_p, 0, sizeof(stat_device_ddos_brief_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    device++;
+                    printf("device count: device %d\n", device);
+                    return cm_p;
+                } else {
+                    break;
+                }
+            case STAT_OBJ_ID_ZONE_SRV_IND:
+                cm_p = malloc(sizeof(indicator_stats_all_t));
+                memset(cm_p, 0, sizeof(indicator_stats_all_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    zone++;
+                    printf("po count: zone %d dst_ent %d zs_ind %d\n", zone, dst_ent, zs_ind);
+                    return cm_p;
+                } else {
+                    break;
+                }*/
+            case STAT_OBJ_ID_ZONE:
+                cm_p = malloc(sizeof(stat_zone_t));
+                memset(cm_p, 0, sizeof(stat_zone_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    zone++;
+                    printf("po count: zone %d dst_ent %d\n", zone, dst_ent);
+                    return cm_p;
+                } else {
+                    break;
+                }
+            case STAT_OBJ_ID_PORT_HTTP:
+                cm_p = malloc(sizeof(cm_stat_http_t));
+                memset(cm_p, 0, sizeof(cm_stat_http_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    srv_http++;
+                    printf("srv count: tcp %d udp %d http %d ssl %d dnstcp %d dnsudp %d p_other %d icmp %d\n",
+                        srv_tcp, srv_udp, srv_http, srv_ssl, srv_dnstcp, srv_dnsudp, srv_proto_other, srv_icmp);
+                    return cm_p;
+                } else {
+                    break;
+                }
+            case STAT_OBJ_ID_PORT_SSLL4:
+                cm_p = malloc(sizeof(cm_stat_ssll4_t));
+                memset(cm_p, 0, sizeof(cm_stat_ssll4_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    srv_ssl++;
+                    printf("srv count: tcp %d udp %d http %d ssl %d dnstcp %d dnsudp %d p_other %d icmp %d\n",
+                        srv_tcp, srv_udp, srv_http, srv_ssl, srv_dnstcp, srv_dnsudp, srv_proto_other, srv_icmp);
+                    return cm_p;
+               } else {
+                    break;
+               }
+            case STAT_OBJ_ID_PORT_DNSTCP:
+                cm_p = malloc(sizeof(cm_stat_dnstcp_t));
+                memset(cm_p, 0, sizeof(cm_stat_dnstcp_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    srv_dnstcp++;
+                    printf("srv count: tcp %d udp %d http %d ssl %d dnstcp %d dnsudp %d p_other %d icmp %d\n",
+                        srv_tcp, srv_udp, srv_http, srv_ssl, srv_dnstcp, srv_dnsudp, srv_proto_other, srv_icmp);
+                    return cm_p;
+               } else {
+                    break;
+               }
+
+            case STAT_OBJ_ID_PORT_DNSUDP:
+                cm_p = malloc(sizeof(cm_stat_dnsudp_t));
+                memset(cm_p, 0, sizeof(cm_stat_dnsudp_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    srv_dnsudp++;
+                    printf("srv count: tcp %d udp %d http %d ssl %d dnstcp %d dnsudp %d p_other %d icmp %d\n",
+                        srv_tcp, srv_udp, srv_http, srv_ssl, srv_dnstcp, srv_dnsudp, srv_proto_other, srv_icmp);
+                    return cm_p;
+               } else {
+                    break;
+               }
+
+            case STAT_OBJ_ID_PORT_TCP:
+                cm_p = malloc(sizeof(cm_stat_tcp_t));
+                memset(cm_p, 0, sizeof(cm_stat_tcp_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    srv_tcp++;
+                    printf("srv count: tcp %d udp %d http %d ssl %d dnstcp %d dnsudp %d p_other %d icmp %d\n",
+                        srv_tcp, srv_udp, srv_http, srv_ssl, srv_dnstcp, srv_dnsudp, srv_proto_other, srv_icmp);
+                    return cm_p;
+                    printf("srv count: tcp %d udp %d http %d ssl %d dnstcp %d dnsudp %d p_other %d icmp %d\n",
+                        srv_tcp, srv_udp, srv_http, srv_ssl, srv_dnstcp, srv_dnsudp, srv_proto_other, srv_icmp);
+               } else {
+                    break;
+               }
+
+            case STAT_OBJ_ID_PORT_UDP:
+                cm_p = malloc(sizeof(cm_stat_udp_t));
+                memset(cm_p, 0, sizeof(cm_stat_udp_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    srv_udp++;
+                    printf("srv count: tcp %d udp %d http %d ssl %d dnstcp %d dnsudp %d p_other %d icmp %d\n",
+                        srv_tcp, srv_udp, srv_http, srv_ssl, srv_dnstcp, srv_dnsudp, srv_proto_other, srv_icmp);
+                    return cm_p;
+               } else {
+                    break;
+               }
+
+            /*case STAT_OBJ_ID_IPPROTO_OTHER:
+                cm_p = malloc(sizeof(cm_stat_ipproto_other_t));
+                memset(cm_p, 0, sizeof(cm_stat_ipproto_other_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    srv_proto_other++;
+                    printf("srv count: tcp %d udp %d http %d ssl %d dnstcp %d dnsudp %d p_other %d icmp %d\n",
+                        srv_tcp, srv_udp, srv_http, srv_ssl, srv_dnstcp, srv_dnsudp, srv_proto_other, srv_icmp);
+                    return cm_p;
+               } else {
+                    break;
+               }
+
+            case STAT_OBJ_ID_IPPROTO_ICMP:
+                cm_p = malloc(sizeof(cm_stat_ipproto_icmp_t));
+                memset(cm_p, 0, sizeof(cm_stat_ipproto_icmp_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    srv_icmp++;
+                    printf("srv count: tcp %d udp %d http %d ssl %d dnstcp %d dnsudp %d p_other %d icmp %d\n",
+                        srv_tcp, srv_udp, srv_http, srv_ssl, srv_dnstcp, srv_dnsudp, srv_proto_other, srv_icmp);
+                    return cm_p;
+               } else {
+                    break;
+               }
+            case STAT_OBJ_ID_DST_ENTRY:
+                cm_p = malloc(sizeof(cm_stat_dst_entry_t));
+                memset(cm_p, 0, sizeof(cm_stat_dst_entry_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    dst_ent++;
+                    printf("po count: zone %d dst_ent %d\n", zone, dst_ent);
+                    return cm_p;
+               } else {
+                    break;
+               }
+            case STAT_OBJ_ID_DST_PORT_SSLL4:
+                cm_p = malloc(sizeof(cm_stat_dst_ssll4_t));
+                memset(cm_p, 0, sizeof(cm_stat_dst_ssll4_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    srv_ssl++;
+                    printf("srv count: tcp %d udp %d http %d ssl %d dnstcp %d dnsudp %d p_other %d icmp %d\n",
+                        srv_tcp, srv_udp, srv_http, srv_ssl, srv_dnstcp, srv_dnsudp, srv_proto_other, srv_icmp);
+                    return cm_p;
+               } else {
+                    break;
+               }
+
+            case STAT_OBJ_ID_DST_PORT_DNSTCP:
+                cm_p = malloc(sizeof(cm_stat_dst_dnstcp_t));
+                memset(cm_p, 0, sizeof(cm_stat_dst_dnstcp_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    srv_dnstcp++;
+                    printf("srv count: tcp %d udp %d http %d ssl %d dnstcp %d dnsudp %d p_other %d icmp %d\n",
+                        srv_tcp, srv_udp, srv_http, srv_ssl, srv_dnstcp, srv_dnsudp, srv_proto_other, srv_icmp);
+                    return cm_p;
+               } else {
+                    break;
+               }
+
+            case STAT_OBJ_ID_DST_PORT_DNSUDP:
+                cm_p = malloc(sizeof(cm_stat_dst_dnsudp_t));
+                memset(cm_p, 0, sizeof(cm_stat_dst_dnsudp_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    srv_dnsudp++;
+                    printf("srv count: tcp %d udp %d http %d ssl %d dnstcp %d dnsudp %d p_other %d icmp %d\n",
+                        srv_tcp, srv_udp, srv_http, srv_ssl, srv_dnstcp, srv_dnsudp, srv_proto_other, srv_icmp);
+                    return cm_p;
+               } else {
+                    break;
+               }
+
+            case STAT_OBJ_ID_DST_PORT_HTTP:
+                cm_p = malloc(sizeof(cm_stat_dst_http_t));
+                memset(cm_p, 0, sizeof(cm_stat_dst_http_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    srv_http++;
+                    printf("srv count: tcp %d udp %d http %d ssl %d dnstcp %d dnsudp %d p_other %d icmp %d\n",
+                        srv_tcp, srv_udp, srv_http, srv_ssl, srv_dnstcp, srv_dnsudp, srv_proto_other, srv_icmp);
+                    return cm_p;
+               } else {
+                    break;
+               }
+
+            case STAT_OBJ_ID_DST_PORT_ICMP:
+                cm_p = malloc(sizeof(cm_stat_dst_icmp_t));
+                memset(cm_p, 0, sizeof(cm_stat_dst_icmp_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    srv_icmp++;
+                    printf("srv count: tcp %d udp %d http %d ssl %d dnstcp %d dnsudp %d p_other %d icmp %d\n",
+                        srv_tcp, srv_udp, srv_http, srv_ssl, srv_dnstcp, srv_dnsudp, srv_proto_other, srv_icmp);
+                    return cm_p;
+               } else {
+                    break;
+               }
+
+            case STAT_OBJ_ID_DST_PORT_UDP:
+                cm_p = malloc(sizeof(cm_stat_dst_udp_t));
+                memset(cm_p, 0, sizeof(cm_stat_dst_udp_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    srv_udp++;
+                    printf("srv count: tcp %d udp %d http %d ssl %d dnstcp %d dnsudp %d p_other %d icmp %d\n",
+                        srv_tcp, srv_udp, srv_http, srv_ssl, srv_dnstcp, srv_dnsudp, srv_proto_other, srv_icmp);
+                    return cm_p;
+               } else {
+                    break;
+               }
+            case STAT_OBJ_ID_DST_PORT_TCP:
+                cm_p = malloc(sizeof(cm_stat_dst_tcp_t));
+                memset(cm_p, 0, sizeof(cm_stat_dst_tcp_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    srv_tcp++;
+                    printf("srv count: tcp %d udp %d http %d ssl %d dnstcp %d dnsudp %d p_other %d icmp %d\n",
+                        srv_tcp, srv_udp, srv_http, srv_ssl, srv_dnstcp, srv_dnsudp, srv_proto_other, srv_icmp);
+                    return cm_p;
+               } else {
+                    break;
+               }
+
+            case STAT_OBJ_ID_DST_PORT_OTHER:
+                cm_p = malloc(sizeof(cm_stat_dst_other_t));
+                memset(cm_p, 0, sizeof(cm_stat_dst_other_t));
+                if (sht_insert_with_str(uuidtable, uuid, (void *)cm_p) == SHT_INSERT_SUCCESS) {
+                    *new_uuid = 1;
+                    srv_proto_other++;
+                    printf("srv count: tcp %d udp %d http %d ssl %d dnstcp %d dnsudp %d p_other %d icmp %d\n",
+                        srv_tcp, srv_udp, srv_http, srv_ssl, srv_dnstcp, srv_dnsudp, srv_proto_other, srv_icmp);
+                    return cm_p;
+               } else {
+                    break;
+               }
+            */
+        }
+    }
+    return NULL;
+}
 
 /*_________________---------------------------__________________
    _________________  readCounters_a10_4_1_n_generic     __________________
  -----------------___________________________------------------
 */
-static void readCounters_a10_4_1_n_generic(SFSample *sample)
+static void readCounters_a10_4_1_n_generic(SFSample *sample, leveldb_t *db1, leveldb_t *db2)
 {   
-    int len = 0;
+    int len = 0, new_uuid = 0, slot_id = 0;
+    struct sflow_flex_kv *keyval_p;
+    u32 key;
+    u64 val;
+    void *cm_p;
     long tstamp = time(NULL);
+    tstamp = tstamp - tstamp % 15;
     char tbuf [200];
     sprintf (tbuf, "agent=%08x\n", htonl(sample->agent_addr.address.ip_v4.addr));
     tbuf[strlen(tbuf)] = 0;
@@ -3354,65 +4642,90 @@ static void readCounters_a10_4_1_n_generic(SFSample *sample)
     int obj_stats_oid = ntohl(a10_custom->schema_oid);
     printf("obj_stats_oid = %d \n", obj_stats_oid);
     printf("schema oid = %d\n", obj_stats_oid);
+    slot_id = get_slot_id(a10_custom->vnp_id);
     printf("vnp_id of ctr = %d\n", ntohl(a10_custom->vnp_id));
     sample->current_context_length = sample->current_context_length-sizeof(struct sfl_a10_custom_info);
     int number_of_counters =  sample->current_context_length/sizeof(struct sflow_flex_kv);
     printf("Number of counters = %d\n", number_of_counters);
+
+    cm_p = get_cm_stat_struct(a10_custom->uuid, obj_stats_oid, &new_uuid);
     struct sflow_flex_kv *kv = (struct sflow_flex_kv *)(sample->datap);
-    int i;
+    int i, ret;
 
-    json_object *data;
-    data = json_object_new_object();
-    if (strlen(a10_custom->uuid) != 36){
-      return;
-    }
-    printf("smaple-> datap = %s\n", sample->header);
-    for(i = 0; i<number_of_counters; i++){
-        /* if (strlen(a10_custom->uuid) != 36) {
-           continue;
-           }*/
-        char tmp[200];
-        sprintf(tmp, "%d", ntohl(kv[i].key));
-        json_object_object_add(data, tmp, json_object_new_int64(ntohll(kv[i].value)));
-        //json_object_object_add(data, json_object_new_string("1"), json_object_new_int(1));
-        printf("key = %d value  = %ld\n", ntohl(kv[i].key), ntohll(kv[i].value));
-    }
+        switch (obj_stats_oid) {
+            //case STAT_OBJ_ID_DEVICE_DDOS_BRIEF:
+            //    handle_device_ddos_brief_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id);
+            //    break;
+            case STAT_OBJ_ID_ZONE:
+                handle_zone_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2);
+                break;
+            case STAT_OBJ_ID_PORT_HTTP:
+                handle_port_http_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2);
+                break;
+            case STAT_OBJ_ID_PORT_SSLL4:
+                handle_port_ssll4_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2);
+                break;
+            case STAT_OBJ_ID_PORT_DNSTCP:
+                handle_port_dnstcp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2);
+                break;
+            case STAT_OBJ_ID_PORT_DNSUDP:
+                handle_port_dnsudp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2);
+                break; 
+            case STAT_OBJ_ID_PORT_TCP: // stats object OID for port tcp and ip-proto tcp is same
+                handle_port_tcp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2);
+                break;
+            case STAT_OBJ_ID_PORT_UDP: // stats object OID for port udp and ip-proto idp is same
+                handle_port_udp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2);
+                break;
+            /*case STAT_OBJ_ID_IPPROTO_OTHER:
+                handle_ipproto_other_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id);
+                break;
+            case STAT_OBJ_ID_IPPROTO_ICMP:
+                handle_ipproto_icmp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id);
+                break;
 
-    //char s2[200];//levelDB, key
-    //sprintf(s2, "%d", obj_stats_oid);
-    char buff[20];
-    time_t now = time(NULL);
-    //printf("%d\n", now);
-    //sprintf(buff, "%d", now);
-    //strftime(buff, 20, "%Y-%m-%d %H:%M:%S", localtime(&now));
-    //int sl = strlen(a10_custom->uuid)+10+sizeof(obj_stats_oid);
-    char key[100] = "", obj_key[100]= ""; 
-    //in real code you would check for errors in malloc here
-    //strcpy(key, s1);
-    //strcat(key, s2); //concat with oid.
-    //strcat(key, ".");
-    //strcat(key, a10_custom->uuid);  //concat with uid.
-    //strcat(key, ".");
-    //strcat(key, buff);    //concat with timestamp.
-    sprintf(obj_key, ".obj.%d.%s", obj_stats_oid, a10_custom->uuid ); 
-    sprintf(key, ".time.%d.%s.%lu", obj_stats_oid, a10_custom->uuid, now); 
-    //root = json_object_new_object();
-    //json_object_object_add(root, "key", json_object_new_string(key));
-    //json_object_object_add(root, "value", data);
-    //printf("json value = %s\n", json_object_to_json_string(data));
-    //ret = leveldb_simple_connect(tsdb_buff);
-    skipBytes(sample, sample->current_context_length);
-    /*Write into levelDB*/
-    char raw_data_db[] = RAW_DB;
-    leveldb_simple_write_data(key, json_object_to_json_string(data), raw_data_db);
-    printf("Test for obj key = %s\n", obj_key);
-    write_object_id(obj_key, obj_stats_oid, a10_custom->uuid);
-    /*Read from levelDB*/
-    printf("Test for key = %s\n", key);
-    leveldb_simple_read_data(key, raw_data_db);
-    //leveldb_simple_read_data(".time", );
-    json_object_put(data);
-    //json_object_put(root);
+            case STAT_OBJ_ID_ZONE_SRV_IND:
+            case STAT_OBJ_ID_ZONE_IPPROTO_NUM_IND:
+            case STAT_OBJ_ID_ZONE_IPPROTO_NAME_IND:
+            case STAT_OBJ_ID_ZONE_SRV_OTHER_IND:
+            case STAT_OBJ_ID_ZONE_SRV_PRANGE_IND:
+                handle_zone_service_indicator_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id);
+                break;
+            
+            case STAT_OBJ_ID_DST_ENTRY:
+                handle_dst_entry_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id);
+                break;
+            case STAT_OBJ_ID_DST_PORT_SSLL4:
+                handle_dst_port_ssll4_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id);
+                break;
+            case STAT_OBJ_ID_DST_PORT_DNSTCP:
+                handle_dst_port_dnstcp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id);
+                break;
+            case STAT_OBJ_ID_DST_PORT_DNSUDP:
+                handle_dst_port_dnsudp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id);
+                break;
+            case STAT_OBJ_ID_DST_PORT_HTTP:
+                handle_dst_port_http_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id);
+                break;
+            case STAT_OBJ_ID_DST_PORT_ICMP:
+                handle_dst_port_icmp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id);
+                break;
+            case STAT_OBJ_ID_DST_PORT_UDP:
+                handle_dst_port_udp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id);
+                break;
+            case STAT_OBJ_ID_DST_PORT_TCP:
+                handle_dst_port_tcp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf);
+                break;
+            case STAT_OBJ_ID_DST_PORT_OTHER:
+                handle_dst_port_other_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id);
+                break; 
+            */
+            default:
+                printf("will not write counters for uuid %s with oid %d\n", a10_custom->uuid, obj_stats_oid);
+                break;
+        }
+
+        skipBytes(sample, sample->current_context_length);
 }
 
 /*_________________---------------------------__________________
@@ -4456,7 +5769,7 @@ typedef union {
 } sflow_enterprise_u;
 
 
-static void readCountersSample(SFSample *sample, int expanded)
+static void readCountersSample(SFSample *sample, int expanded, leveldb_t *db1, leveldb_t *db2)
 {
     uint32_t sampleLength;
     uint32_t num_elements;
@@ -4507,111 +5820,20 @@ static void readCountersSample(SFSample *sample, int expanded)
 				//readCounters_generic(sample);
 				printf("\nhit SFLCOUNTERS_GENERIC_41n:\n");
 				//readCounters_a10_generic(sample);
-				readCounters_a10_4_1_n_generic(sample);
+				readCounters_a10_4_1_n_generic(sample, db1, db2);
 				break;
-			case SFLCOUNTERS_ETHERNET:
-				readCounters_ethernet(sample);
-				break;
-			case SFLCOUNTERS_TOKENRING:
-				readCounters_tokenring(sample);
-				break;
-			case SFLCOUNTERS_VG:
-				readCounters_vg(sample);
-				break;
-			case SFLCOUNTERS_VLAN:
-				readCounters_vlan(sample);
-				break;
-			case SFLCOUNTERS_80211:
-				readCounters_80211(sample);
-				break;
-			case SFLCOUNTERS_LACP:
-				readCounters_LACP(sample);
-				break;
-			case SFLCOUNTERS_PROCESSOR:
-                readCounters_a10_4_1_n_generic(sample);
-				//readCounters_processor(sample);
-				break;
-			case SFLCOUNTERS_RADIO:
-				readCounters_radio(sample);
-				break;
-			case SFLCOUNTERS_HOST_HID:
-				readCounters_host_hid(sample);
-				break;
-			case SFLCOUNTERS_ADAPTORS:
-				readCounters_adaptors(sample);
-				break;
-			case SFLCOUNTERS_HOST_PAR:
-				readCounters_host_parent(sample);
-				break;
-			case SFLCOUNTERS_HOST_CPU:
-				readCounters_host_cpu(sample);
-				break;
-			case SFLCOUNTERS_HOST_MEM:
-				readCounters_host_mem(sample);
-				break;
-			case SFLCOUNTERS_HOST_DSK:
-				readCounters_host_dsk(sample);
-				break;
-			case SFLCOUNTERS_HOST_NIO:
-				readCounters_host_nio(sample);
-				break;
-			case SFLCOUNTERS_HOST_VRT_NODE:
-				readCounters_host_vnode(sample);
-				break;
-			case SFLCOUNTERS_HOST_VRT_CPU:
-				readCounters_host_vcpu(sample);
-				break;
-			case SFLCOUNTERS_HOST_VRT_MEM:
-				readCounters_host_vmem(sample);
-				break;
-			case SFLCOUNTERS_HOST_VRT_DSK:
-				readCounters_host_vdsk(sample);
-				break;
-			case SFLCOUNTERS_HOST_VRT_NIO:
-				readCounters_host_vnio(sample);
-				break;
-			case SFLCOUNTERS_HOST_GPU_NVML:
-				readCounters_host_gpu_nvml(sample);
-				break;
-			case SFLCOUNTERS_MEMCACHE:
-				readCounters_memcache(sample);
-				break;
-			case SFLCOUNTERS_MEMCACHE2:
-				readCounters_memcache2(sample);
-				break;
-			case SFLCOUNTERS_HTTP:
-				readCounters_http(sample);
-				break;
-			case SFLCOUNTERS_JVM:
-				readCounters_JVM(sample);
-				break;
-			case SFLCOUNTERS_JMX:
-				readCounters_JMX(sample, length);
-				break;
-			case SFLCOUNTERS_APP:
-				readCounters_APP(sample);
-				break;
-			case SFLCOUNTERS_APP_RESOURCE:
-				readCounters_APP_RESOURCE(sample);
-				break;
-			case SFLCOUNTERS_APP_WORKERS:
-				readCounters_APP_WORKERS(sample);
-				break;
-			case SFLCOUNTERS_VDI:
-				readCounters_VDI(sample);
-				break;
-#ifdef A10_SFLOW
 				// A10 3.2/4.1 SFlow Packet
 				//   case SFLCOUNTERS_DDOS_FLEX:
+		        case SFLCOUNTERS_DDOS_FLEX:
+                            readCounters_a10_4_1_n_generic(sample, db1, db2);
+                            break;
 			case SFL_COUNTER_REC_GENERIC_A10:    
 				{ 
 					printf("\nhit SFL_COUNTER_REC_GENERIC_A10_41n:\n");
 					//readCounters_a10_generic(sample);
-					readCounters_a10_4_1_n_generic(sample);
+					readCounters_a10_4_1_n_generic(sample, db1, db2);
 					break;
 				}
-
-#endif /* A10_SFLOW */
 			default:
 				skipTLVRecord(sample, tag, length, "Skip_counters_sample_element");
 				break;
@@ -4635,7 +5857,7 @@ static void readCountersSample(SFSample *sample, int expanded)
   -----------------___________________________------------------
 */
 
-static void readSFlowDatagram(SFSample *sample)
+static void readSFlowDatagram(SFSample *sample, leveldb_t *db1, leveldb_t *db2)
 {
     uint32_t samplesInPacket;
     struct timeval now;
@@ -4695,13 +5917,13 @@ static void readSFlowDatagram(SFSample *sample)
                         readFlowSample(sample, NO);
                         break;
                     case SFLCOUNTERS_SAMPLE:
-                        readCountersSample(sample, NO);
+                        readCountersSample(sample, NO, db1, db2);
                         break;
                     case SFLFLOW_SAMPLE_EXPANDED:
                         readFlowSample(sample, YES);
                         break;
                     case SFLCOUNTERS_SAMPLE_EXPANDED:
-                        readCountersSample(sample, YES);
+                        readCountersSample(sample, YES, db1, db2);
                         break;
                     default:
                         skipTLVRecord(sample, sample->sampleType, getData32(sample), "sample");
@@ -4730,7 +5952,7 @@ static void readSFlowDatagram(SFSample *sample)
   -----------------___________________________------------------
 */
 
-static void receiveSFlowDatagram(SFSample *sample)
+static void receiveSFlowDatagram(SFSample *sample, leveldb_t *db1, leveldb_t *db2)
 {
     if (sfConfig.forwardingTargets) {
         // if we are forwarding, then do nothing else (it might
@@ -4757,7 +5979,7 @@ static void receiveSFlowDatagram(SFSample *sample)
             // TRY
             sample->datap = (uint32_t *)sample->rawSample;
             sample->endp = (u_char *)sample->rawSample + sample->rawSampleLen;
-            readSFlowDatagram(sample);
+            readSFlowDatagram(sample, db1, db2);
         } else {
             // CATCH
             fprintf(ERROUT, "caught exception: %d\n", exceptionVal);
@@ -4861,7 +6083,7 @@ static int ipv4MappedAddress(SFLIPv6 *ipv6addr, SFLIPv4 *ip4addr)
   -----------------___________________________------------------
 */
 
-static void readPacket(int soc)
+static void readPacket(int soc, leveldb_t *db1, leveldb_t *db2)
 {
     struct sockaddr_in6 peer;
     int alen, cc;
@@ -4891,7 +6113,7 @@ static void readPacket(int soc)
             sample.sourceIP.address.ip_v4 = v4src;
         }
     }
-    receiveSFlowDatagram(&sample);
+    receiveSFlowDatagram(&sample, db1, db2);
 }
 
 /*_________________---------------------------__________________
@@ -5033,7 +6255,7 @@ static int pcapOffsetToSFlow(u_char *start, int len)
 
 
 
-static int readPcapPacket(FILE *file)
+static int readPcapPacket(FILE *file, leveldb_t *db1, leveldb_t *db2)
 {
     u_char buf[2048];
     struct pcap_pkthdr hdr;
@@ -5078,7 +6300,7 @@ static int readPcapPacket(FILE *file)
         sample.rawSample = buf + skipBytes;
         sample.rawSampleLen = hdr.caplen - skipBytes;
         sample.pcapTimestamp = hdr.ts_sec;
-        receiveSFlowDatagram(&sample);
+        receiveSFlowDatagram(&sample, db1, db2);
     }
     return 1;
 }
@@ -5417,6 +6639,17 @@ int main(int argc, char *argv[])
         setmode(1, O_BINARY);
     }
 #endif
+    uuidtable = sht_alloc(NUM_SHT_BUCKETS);
+    leveldb_t *db1, *db2;
+    leveldb_options_t *options1, *options2;
+    char *err1 = NULL;
+    char *err2 = NULL;
+    options1 = leveldb_options_create();
+    options2 = leveldb_options_create();
+    leveldb_options_set_create_if_missing(options1, 1);
+    leveldb_options_set_create_if_missing(options2, 1);
+    db1 = leveldb_open(options1, RAW_DB,  &err1);
+    db2 = leveldb_open(options2, UUID_STORE, &err2);
 
     /* reading from file or socket? */
     if (sfConfig.readPcapFileName) {
@@ -5458,7 +6691,7 @@ int main(int argc, char *argv[])
     }
     if (sfConfig.readPcapFile) {
         /* just use a blocking read */
-        while (readPcapPacket(sfConfig.readPcapFile));
+        while (readPcapPacket(sfConfig.readPcapFile, db1, db2));
     } else {
         fd_set readfds;
         /* set the select mask */
@@ -5492,108 +6725,25 @@ int main(int argc, char *argv[])
             }
             if (nfds > 0) {
                 if (soc4 != -1 && FD_ISSET(soc4, &readfds)) {
-                    readPacket(soc4);
+                    readPacket(soc4, db1, db2);
                 }
                 if (soc6 != -1 && FD_ISSET(soc6, &readfds)) {
-                    readPacket(soc6);
+                    readPacket(soc6, db1, db2);
                 }
             }
         }
     }
+    leveldb_close(db1);
+    leveldb_close(db2);
     return 0;
 }
 
-
-
-int opentsdb_connect_socket()
-{
-    struct sockaddr_in echoServAddr; /* Echo server address */
-    unsigned short echoServPort;     /* Echo server port */
-    static int error_flag = 0;
-    //    int bytesRcvd, totalBytesRcvd;   /* Bytes read in single recv()
-    //                                        and total bytes read */
-
-    char *servIP = "127.0.0.1";             /* First arg: server IP address (dotted quad) */
-    echoServPort = 4242;
-
-    /* Create a reliable, stream socket using TCP */
-    if ((g_opentsdb_sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
-        dump_syslog (LOG_ERR, "Unable to create opentsdb socket\n"); 
-        return 1;
-    }
-
-    int option_val = 1;
-    setsockopt( g_opentsdb_sock, IPPROTO_TCP, TCP_NODELAY, (void *)&option_val, sizeof(option_val));
-
-    option_val = 4024;
-    setsockopt( g_opentsdb_sock, IPPROTO_TCP, TCP_MAXSEG, (void *)&option_val, sizeof(option_val));
-
-    /* Construct the server address structure */
-    echoServAddr.sin_family      = AF_INET;             /* Internet address family */
-    echoServAddr.sin_addr.s_addr = inet_addr(servIP);   /* Server IP address */
-    echoServAddr.sin_port        = htons(echoServPort); /* Server port */
-
-    /* Establish the connection to the echo server */
-    if (connect(g_opentsdb_sock, (struct sockaddr *) &echoServAddr, sizeof(echoServAddr)) < 0) {
-        if (!error_flag) {
-            dump_syslog (LOG_ERR, "Unable to connect to opentsdb server %s port %d\n", servIP, echoServPort); 
-        }
-
-        error_flag = 1;
-        close(g_opentsdb_sock);
-        return 1;
-    } else {
-        g_opentsdb_socket_connected = 1;
-        dump_syslog (LOG_INFO, "Connected to opentsdb server %s port %d\n", servIP, echoServPort); 
-        error_flag = 0;
-        return 0;
-    }
-}
-
-
-int leveldb_simple_connect(leveldb_t *db)
-{
-    leveldb_options_t *options;
-    char *err = NULL;
-
-    /* OPEN */
-    options = leveldb_options_create();
-    leveldb_options_set_create_if_missing(options, 1);
-    db = leveldb_open(options, "testdb", &err);
-
-    if (err != NULL) {
-      fprintf(stderr, "Open fail.\n");
-      return(1);
-    }
-
-    /* reset error var */
-    leveldb_free(err); err = NULL;
-    return 0;
-}
-
-int leveldb_simple_write_data(char *key, char *value, char *db_name) {
-    leveldb_t *db;
-    leveldb_options_t *options;
-    char *err = NULL;
-    /******************************************/
-    /* OPEN */
-
-    options = leveldb_options_create();
-    leveldb_options_set_create_if_missing(options, 1);
-    db = leveldb_open(options, db_name, &err);
-
-    if (err != NULL) {
-      fprintf(stderr, "Open fail: %s.\n", err);
-      return(1);
-    }
-
-    /* reset error var */
-    leveldb_free(err); err = NULL;
-    /******************************************/
+int batch = 0;
+int leveldb_simple_write_data(char *key, char *value, leveldb_t *db) {
     /* WRITE */
-    leveldb_writeoptions_t *woptions;
     size_t key_len = strlen(key), value_len = strlen(value);
-    //printf("Start putting into DB, %s, %d, %s, %d\n", key, key_len, value, value_len);
+    char *err = NULL;
+    leveldb_writeoptions_t *woptions;
     woptions = leveldb_writeoptions_create();
     leveldb_put(db, woptions, key, key_len, value, value_len, &err);
 
@@ -5603,46 +6753,6 @@ int leveldb_simple_write_data(char *key, char *value, char *db_name) {
     }
 
     leveldb_free(err); err = NULL;   
-    /*CLOSE*/
-    leveldb_close(db);
-    return 0;
-}
-
-int leveldb_simple_read_data(char *key, char *db_name) {
-    leveldb_t *db;
-    leveldb_options_t *options;
-    char *err = NULL;
-    /******************************************/
-    /* OPEN */
-
-    options = leveldb_options_create();
-    leveldb_options_set_create_if_missing(options, 1);
-    db = leveldb_open(options, db_name,  &err);
-
-    if (err != NULL) {
-      fprintf(stderr, "Open fail.\n");
-      return 1;
-    }
-
-    /* reset error var */
-    leveldb_free(err); err = NULL;
-
-    /******************************************/
-    /* READ */
-    leveldb_readoptions_t *roptions;
-    char *read;
-    size_t read_len, key_len =strlen(key);
-    roptions = leveldb_readoptions_create();
-    read = leveldb_get(db, roptions, key, key_len, &read_len, &err);
-
-    if (err != NULL) {
-      fprintf(stderr, "Read fail.\n");
-      return 1;
-    }
-    printf("The value of key: %s\n", read);
-
-    leveldb_free(err); err = NULL;
-    leveldb_close(db);
     return 0;
 }
 
