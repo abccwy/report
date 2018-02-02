@@ -64,7 +64,7 @@ CONFIG_CLEAN_FILES =
 CONFIG_CLEAN_VPATH_FILES =
 am__installdirs = "$(DESTDIR)$(bindir)"
 PROGRAMS = $(bin_PROGRAMS)
-am_sflowtool_OBJECTS = sflowtool.$(OBJEXT)
+am_sflowtool_OBJECTS = sflowtool.$(OBJEXT) sht.o
 sflowtool_OBJECTS = $(am_sflowtool_OBJECTS)
 sflowtool_LDADD = $(LDADD)
 DEFAULT_INCLUDES = -I. -I$(top_builddir)
@@ -179,7 +179,7 @@ target_alias =
 top_build_prefix = ../
 top_builddir = ..
 top_srcdir = ..
-sflowtool_SOURCES = sflow.h sflowtool.h sflowtool.c
+sflowtool_SOURCES = sflow.h sflowtool.h sflowtool.c sht.c
 all: all-am
 
 .SUFFIXES:

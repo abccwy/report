@@ -21,10 +21,13 @@
 #define _SFLOW_DDOS_EXT_V1_H_
 
 #include <sys/types.h>
+#include "sto_types.h"
+/*
 typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint16_t u16;
 typedef uint8_t u8;
+*/
 #define DDOS_TOTAL_L4_TYPE_SIZE 4
 #define DDOS_TOTAL_APP_TYPE_SIZE 7
 
@@ -1923,4 +1926,383 @@ struct sflow_ddos_entry_map_v1 {
     u16 port;
     u8  entry_name[64];
 } __attribute__((packed));
+
+typedef enum {
+    // global ddos brief stats
+    STAT_OBJ_ID_DEVICE_DDOS_BRIEF = 416,
+    
+    // general stats for zone from mitigator
+    STAT_OBJ_ID_ZONE = 2312,
+    STAT_OBJ_ID_PORT_TCP = 2313,
+    STAT_OBJ_ID_PORT_UDP = 2314,
+    STAT_OBJ_ID_PORT_DNSTCP = 2315,
+    STAT_OBJ_ID_PORT_DNSUDP = 2316,
+    STAT_OBJ_ID_PORT_SSLL4 = 2317,
+    STAT_OBJ_ID_PORT_HTTP = 2318,
+    STAT_OBJ_ID_IPPROTO_OTHER = 2319,
+    STAT_OBJ_ID_IPPROTO_ICMP = 2320,
+
+    // indicator stats from mitigator or detector:
+    STAT_OBJ_ID_ZONE_SRV_IND = 2401,
+    STAT_OBJ_ID_ZONE_IPPROTO_NUM_IND = 2408,
+    STAT_OBJ_ID_ZONE_IPPROTO_NAME_IND = 2409,
+    STAT_OBJ_ID_ZONE_SRV_OTHER_IND = 2410,
+    STAT_OBJ_ID_ZONE_SRV_PRANGE_IND = 2411,
+ 
+    // general stats for dest entry from mitigator
+    STAT_OBJ_ID_DST_ENTRY = 2301,
+    STAT_OBJ_ID_DST_PORT_SSLL4 = 2302,
+    STAT_OBJ_ID_DST_PORT_DNSTCP = 2303,
+    STAT_OBJ_ID_DST_PORT_DNSUDP = 2304,
+    STAT_OBJ_ID_DST_PORT_HTTP = 2305,
+    STAT_OBJ_ID_DST_PORT_ICMP = 2307,
+    STAT_OBJ_ID_DST_PORT_UDP = 2308,
+    STAT_OBJ_ID_DST_PORT_TCP = 2309,
+    STAT_OBJ_ID_DST_PORT_OTHER = 2310
+} sflow_tps_stat_obj_id;
+
+#define MAX_CH_SLOTS 2  // max chassis slots
+
+#define slot_to_index(s) ((s > 0) ? (s-1) : 0)
+
+typedef struct stat_device_ddos_brief {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 total_pkts_rcvd;
+  u64 total_pkts_drop;
+  u64 total_pkts_pass;
+  u64 total_bytes_rcvd;
+  u64 total_bytes_drop;
+  u64 total_bytes_pass;
+} stat_device_ddos_brief_t;
+
+typedef struct stat_zone {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd_inb;
+  u64 pkts_drop_inb;
+  u64 pkts_pass_inb;
+  u64 bytes_rcvd_inb;
+  u64 bytes_drop_inb;
+  u64 bytes_pass_inb;
+} stat_zone_t;
+
+typedef struct cm_stat_http {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd;
+  u64 pkts_drop;
+  u64 pkts_pass;
+  u64 bytes_rcvd;
+  u64 bytes_drop;
+  u64 bytes_pass;
+  u64 http_port_glid_drop;
+  u64 http_blacklist_drop;
+  u64 http_tcp_auth_drop;
+  u64 http_src_based_glid_drop;
+  u64 http_tcp_service_drop;
+  u64 http_auth_drop;
+  u64 http_service_drop;
+  u64 syn_auth_pass;
+} cm_stat_http_t;
+
+typedef struct cm_stat_ssll4 {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd;
+  u64 pkts_drop;
+  u64 pkts_pass;
+  u64 bytes_rcvd;
+  u64 bytes_drop;
+  u64 bytes_pass;
+  u64 ssll4_port_glid_drop;
+  u64 ssll4_blacklist_drop;
+  u64 ssll4_tcp_auth_drop;
+  u64 ssll4_src_based_glid_drop;
+  u64 ssll4_tcp_service_drop;
+  u64 ssll4_auth_drop;
+  u64 ssll4_service_drop;
+  u64 syn_auth_pass;
+} cm_stat_ssll4_t;
+
+typedef struct cm_stat_dnstcp {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd;
+  u64 pkts_drop;
+  u64 pkts_pass;
+  u64 bytes_rcvd;
+  u64 bytes_drop;
+  u64 bytes_pass;
+  u64 dnstcp_port_glid_drop;
+  u64 dnstcp_blacklist_drop;
+  u64 dnstcp_src_based_glid_drop;
+  u64 dnstcp_service_drop;
+} cm_stat_dnstcp_t;
+
+typedef struct cm_stat_dnsudp {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd;
+  u64 pkts_drop;
+  u64 pkts_pass;
+  u64 bytes_rcvd;
+  u64 bytes_drop;
+  u64 bytes_pass;
+  u64 dnsudp_port_glid_drop;
+  u64 dnsudp_blacklist_drop;
+  u64 dnsudp_src_based_glid_drop;
+  u64 dnsudp_auth_drop;
+  u64 dnsudp_service_drop;
+  u64 udp_auth_pass;
+} cm_stat_dnsudp_t;
+
+typedef struct cm_stat_tcp {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd;
+  u64 pkts_drop;
+  u64 pkts_pass;
+  u64 bytes_rcvd;
+  u64 bytes_drop;
+  u64 bytes_pass;
+  u64 tcp_port_glid_drop;
+  u64 tcp_blacklist_drop;
+  u64 tcp_auth_drop;
+  u64 tcp_src_based_glid_drop;
+  u64 tcp_service_drop;
+  u64 syn_auth_pass;
+} cm_stat_tcp_t;
+
+typedef struct cm_stat_udp {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd;
+  u64 pkts_drop;
+  u64 pkts_pass;
+  u64 bytes_rcvd;
+  u64 bytes_drop;
+  u64 bytes_pass;
+  u64 udp_port_glid_drop;
+  u64 udp_blacklist_drop;
+  u64 udp_auth_drop;
+  u64 udp_src_based_glid_drop;
+  u64 udp_service_drop;
+} cm_stat_udp_t;
+
+typedef struct cm_stat_ipproto_icmp {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd;
+  u64 pkts_drop;
+  u64 pkts_pass;
+  u64 bytes_rcvd;
+  u64 bytes_drop;
+  u64 bytes_pass;
+  u64 ipproto_icmp_port_glid_drop;
+  u64 ipproto_icmp_blacklist_drop;
+  u64 ipproto_icmp_src_based_glid_drop;
+  u64 ipproto_icmp_service_drop;
+} cm_stat_ipproto_icmp_t;
+
+typedef struct cm_stat_ipproto_other {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd;
+  u64 pkts_drop;
+  u64 pkts_pass;
+  u64 bytes_rcvd;
+  u64 bytes_drop;
+  u64 bytes_pass;
+  u64 ipproto_other_port_glid_drop;
+  u64 ipproto_other_blacklist_drop;
+  u64 ipproto_other_src_based_glid_drop;
+  u64 ipproto_other_service_drop;
+} cm_stat_ipproto_other_t;
+
+typedef struct cm_stat_dst_entry {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd;
+  u64 pkts_drop;
+  u64 pkts_pass;
+  u64 bytes_rcvd;
+  u64 bytes_drop;
+  u64 bytes_pass;
+  u64 dst_l4_drop;
+  u64 src_l4_drop;
+  u64 src_based_policy_drop;
+  u64 dst_tcp_dropped;
+  u64 dst_udp_dropped;
+  u64 dst_icmp_dropped;
+  u64 dst_other_dropped;
+  u64 dst_src_tcp_dropped;
+  u64 dst_src_udp_dropped;
+  u64 dst_src_other_dropped;   
+  u64 syn_auth;
+  u64 dst_port_cm_dropped;
+  u64 port_wildcards_dropped;
+  u64 src_auth_dropped;
+  u64 port_tcp_udp_dropped;
+  u64 src_rates_dropped;
+  u64 ip_proto_dropped;
+  u64 port_cm_dropped;
+  u64 dst_frag_dropped;
+  u64 tcp_inb_pkt_rcvd;
+  u64 udp_inb_pkt_rcvd;
+  u64 icmp_inb_pkt_rcvd;
+  u64 tcp_total_pkt_rcvd;
+  u64 udp_total_pkt_rcvd;
+  u64 icmp_total_pkt_rcvd;
+  u64 other_total_pkt_rcvd;
+  u64 tcp_total_pkt_pass;
+  u64 tcp_total_pkt_drop;
+  u64 udp_total_pkt_pass;
+  u64 udp_total_pkt_drop;
+  u64 icmp_total_pkt_pass;
+  u64 icmp_total_pkt_drop;
+  u64 other_total_pkt_pass;
+  u64 other_total_pkt_drop;
+  u64 tcp_session;
+  u64 udp_session;
+  u64 tcp_total_syn_rcvd;
+  u64 tcp_total_fin_rcvd;
+} cm_stat_dst_entry_t;
+
+typedef struct cm_stat_dst_tcp {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd;
+  u64 pkts_drop;
+  u64 pkts_pass;
+  u64 bytes_rcvd;
+  u64 bytes_drop;
+  u64 bytes_pass;
+  u64 port_tcp_dropped;
+  u64 tcp_dropped;
+  u64 src_tcp_dropped;
+} cm_stat_dst_tcp_t;
+
+typedef struct cm_stat_dst_udp {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd;
+  u64 pkts_drop;
+  u64 pkts_pass;
+  u64 bytes_rcvd;
+  u64 bytes_drop;
+  u64 bytes_pass;
+  u64 port_udp_dropped;
+  u64 udp_dropped;
+  u64 src_udp_dropped;
+} cm_stat_dst_udp_t;
+
+typedef struct cm_stat_dst_icmp {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd;
+  u64 pkts_drop;
+  u64 pkts_pass;
+  u64 bytes_rcvd;
+  u64 bytes_drop;
+  u64 bytes_pass;
+  u64 icmp_dropped;
+  u64 icmp_template_dropped;
+} cm_stat_dst_icmp_t;
+
+typedef struct cm_stat_dst_other {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd;
+  u64 pkts_drop;
+  u64 pkts_pass;
+  u64 bytes_rcvd;
+  u64 bytes_drop;
+  u64 bytes_pass;
+  u64 ip_proto_dropped;
+  u64 other_dropped;
+  u64 src_other_dropped;
+} cm_stat_dst_other_t;
+
+typedef struct cm_stat_dst_dnstcp {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd;
+  u64 pkts_drop;
+  u64 pkts_pass;
+  u64 bytes_rcvd;
+  u64 bytes_drop;
+  u64 bytes_pass;
+  u64 port_dns_tcp_dropped;
+  u64 dns_tcp_dropped;
+  u64 app_cm_dropped;
+  u64 src_dns_dropped;
+} cm_stat_dst_dnstcp_t;
+
+typedef struct cm_stat_dst_dnsudp {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd;
+  u64 pkts_drop;
+  u64 pkts_pass;
+  u64 bytes_rcvd;
+  u64 bytes_drop;
+  u64 bytes_pass;
+  u64 port_dns_udp_dropped;
+  u64 dns_udp_dropped;
+  u64 force_tcp;
+  u64 app_cm_dropped;
+  u64 src_dns_dropped;
+} cm_stat_dst_dnsudp_t;
+
+typedef struct cm_stat_dst_http {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd;
+  u64 pkts_drop;
+  u64 pkts_pass;
+  u64 bytes_rcvd;
+  u64 bytes_drop;
+  u64 bytes_pass;
+  u64 port_http_dropped;
+  u64 http_dropped;
+  u64 http_policy_violation;
+  u64 http_challenge;
+  u64 app_cm_dropped;
+  u64 src_http_dropped;
+} cm_stat_dst_http_t;
+
+typedef struct cm_stat_dst_ssll4 {
+  long timestamp;
+  u32 last_key[MAX_CH_SLOTS];
+  u32 slots;
+  u64 pkts_rcvd;
+  u64 pkts_drop;
+  u64 pkts_pass;
+  u64 bytes_rcvd;
+  u64 bytes_drop;
+  u64 bytes_pass;
+  u64 port_ssl_dropped;
+  u64 ssl_dropped;
+  u64 app_cm_dropped;
+  u64 src_ssl_dropped;
+} cm_stat_dst_ssll4_t;
 #endif /* _SFLOW_DDOS_EXT_V1_H_ */
