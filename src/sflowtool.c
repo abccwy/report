@@ -82,6 +82,9 @@ extern "C" {
 */
 
 #define RAW_DB "record-sec"
+#define TABLE_MIN "record-min"
+#define TABLE_HOUR "record-hr"
+#define TABLE_DAY "record-day"
 #define UUID_STORE "uuid_store"
 
 /* just do it in a portable way... */
@@ -508,6 +511,7 @@ typedef struct _NFFlowPkt5 {
 sht_t *uuidtable = NULL;
 #define NUM_UUIDS 30000
 #define NUM_SHT_BUCKETS NUM_UUIDS/3
+
 
 static void readFlowSample_header(SFSample *sample);
 static void readFlowSample(SFSample *sample, int expanded);
@@ -3288,13 +3292,12 @@ int received_from_all_slots(slots_rcvd_so_far, slot_new_rcvd)
 }
 
 int send_zone_stats(const char *uuid, stat_zone_t *stats_p,
-        const char *agent_info, leveldb_t *db1, leveldb_t *db2)
+        leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
-    int ret = -1;
+    int ret;
     json_object *data;
     char key[100] = "";
-    char ts[11] = "";
-    sprintf(ts, "%lu", stats_p->timestamp);
+    char *err = NULL;
     sprintf(key, ".rpt.%s.%lu", uuid, stats_p->timestamp);
     data = json_object_new_object();
     json_object_object_add(data, "pkts_rcvd_inb", json_object_new_int64(stats_p->pkts_rcvd_inb));
@@ -3304,15 +3307,14 @@ int send_zone_stats(const char *uuid, stat_zone_t *stats_p,
     json_object_object_add(data, "bytes_drop_inb", json_object_new_int64(stats_p->bytes_drop_inb));
     json_object_object_add(data, "bytes_pass_inb", json_object_new_int64(stats_p->bytes_pass_inb));
     leveldb_simple_write_data(key, json_object_to_json_string(data), db1);
-    leveldb_simple_write_data(uuid, ts, db2);
+    leveldb_downsampling(key, uuid, data, stats_p->timestamp, db2, db_min, db_hr, db_day);
     sf_debug("Writing data to Leveldb: Zone uuid=%s", uuid);
-
     return ret;
 }
 
 int handle_zone_stats(const char *uuid,
     struct sflow_flex_kv *kv, int num_counters,
-    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2)
+    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
     int i, len = 0, ret = 0, idx;
     u32 key;
@@ -3378,7 +3380,7 @@ int handle_zone_stats(const char *uuid,
 
     if ((stats_p->last_key[0] >= max_cntr_id) &&
         ((slot_id == 0) || (stats_p->last_key[1] >= max_cntr_id))) {
-        ret = send_zone_stats(uuid, stats_p, tags_buf, db1, db2);
+        ret = send_zone_stats(uuid, stats_p, db1, db2, db_min, db_hr, db_day);
         memset(stats_p, 0, sizeof(stat_zone_t));
     }
 
@@ -3386,10 +3388,10 @@ int handle_zone_stats(const char *uuid,
 }
 
 int send_zone_port_http_stats(const char *uuid, cm_stat_http_t *stats_p, 
-        const char *agent_info, int send_pps_bps, int send_cm, leveldb_t *db1, leveldb_t *db2)
+         int send_pps_bps, int send_cm, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
     char buf[2048];
-    int len = 0, ret = -1;
+    int len = 0, ret;
     json_object *data;
     char key[100] = "";
     char ts[11] = "";
@@ -3418,7 +3420,7 @@ int send_zone_port_http_stats(const char *uuid, cm_stat_http_t *stats_p,
 
     if (send_pps_bps || send_cm) {
         leveldb_simple_write_data(key, json_object_to_json_string(data), db1);
-        leveldb_simple_write_data(uuid, ts, db2);
+        leveldb_downsampling(key, uuid, data, stats_p->timestamp, db2, db_min, db_hr, db_day);
         sf_debug("Writing data to Leveldb: uuid=%s", uuid);
     }
     return ret;
@@ -3426,7 +3428,7 @@ int send_zone_port_http_stats(const char *uuid, cm_stat_http_t *stats_p,
 
 int handle_port_http_stats(const char *uuid,
     struct sflow_flex_kv *kv, int num_counters,
-    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2)
+    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
     int i, len = 0, ret, idx;
     u32 key;
@@ -3554,17 +3556,16 @@ int handle_port_http_stats(const char *uuid,
 
     if ((cm_p->last_key[0] >= max_cntr_id) &&
         ((slot_id == 0) || (cm_p->last_key[1] >= max_cntr_id))) {
-        ret = send_zone_port_http_stats(uuid, cm_p, tags_buf, 1, 1, db1, db2);
+        ret = send_zone_port_http_stats(uuid, cm_p, 1, 1, db1, db2, db_min, db_hr, db_day);
         memset(cm_p, 0, sizeof(cm_stat_http_t));
     }
     return ret;
 }
 
 int send_zone_port_ssll4_stats(const char *uuid, cm_stat_ssll4_t *stats_p, 
-        const char *agent_info, int send_pps_bps, int send_cm, leveldb_t *db1, leveldb_t *db2)
+         int send_pps_bps, int send_cm, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
-    char buf[2048];
-    int len = 0, ret = -1;
+    int ret;
     json_object *data;
     char ts[11] = "";
     sprintf(ts, "%lu", stats_p->timestamp);
@@ -3595,7 +3596,7 @@ int send_zone_port_ssll4_stats(const char *uuid, cm_stat_ssll4_t *stats_p,
 
     if (send_pps_bps || send_cm) {
         leveldb_simple_write_data(key, json_object_to_json_string(data), db1);
-        leveldb_simple_write_data(uuid, ts, db2);
+        leveldb_downsampling(key, uuid, data, stats_p->timestamp, db2, db_min, db_hr, db_day);
         sf_debug("Writing data to Leveldb: uuid=%s", uuid);
     }
     return ret;
@@ -3603,7 +3604,7 @@ int send_zone_port_ssll4_stats(const char *uuid, cm_stat_ssll4_t *stats_p,
 
 int handle_port_ssll4_stats(const char *uuid,
     struct sflow_flex_kv *kv, int num_counters,
-    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2)
+    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
     int i, len = 0, ret, idx;
     u32 key;
@@ -3728,17 +3729,17 @@ int handle_port_ssll4_stats(const char *uuid,
 
     if ((cm_p->last_key[0] >= max_cntr_id) &&
         ((slot_id == 0) || (cm_p->last_key[1] >= max_cntr_id))) {
-        ret = send_zone_port_ssll4_stats(uuid, cm_p, tags_buf, 1, 1, db1, db2);
+        ret = send_zone_port_ssll4_stats(uuid, cm_p, 1, 1, db1, db2, db_min, db_hr, db_day);
         memset(cm_p, 0, sizeof(cm_stat_ssll4_t));
     }
     return ret;
 }
 
 int send_zone_port_dnstcp_stats(const char *uuid, cm_stat_dnstcp_t *stats_p, 
-        const char *agent_info, int send_pps_bps, int send_cm, leveldb_t *db1, leveldb_t *db2)
+         int send_pps_bps, int send_cm, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
     char buf[2048];
-    int len = 0, ret = -1;
+    int len = 0, ret;
     json_object *data;
     char ts[11] = "";
     sprintf(ts, "%lu", stats_p->timestamp);
@@ -3763,7 +3764,7 @@ int send_zone_port_dnstcp_stats(const char *uuid, cm_stat_dnstcp_t *stats_p,
 
     if (send_pps_bps || send_cm) {
         leveldb_simple_write_data(key, json_object_to_json_string(data), db1);
-        leveldb_simple_write_data(uuid, ts, db2);
+        leveldb_downsampling(key, uuid, data, stats_p->timestamp, db2, db_min, db_hr, db_day);
         sf_debug("Writing data to Leveldb: uuid=%s", uuid);
     }
     return ret;
@@ -3771,7 +3772,7 @@ int send_zone_port_dnstcp_stats(const char *uuid, cm_stat_dnstcp_t *stats_p,
 
 int handle_port_dnstcp_stats(const char *uuid,
     struct sflow_flex_kv *kv, int num_counters,
-    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2)
+    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
     int i, len = 0, ret, idx;
     u32 key;
@@ -3890,7 +3891,7 @@ int handle_port_dnstcp_stats(const char *uuid,
 
     if ((cm_p->last_key[0] >= max_cntr_id) &&
         ((slot_id == 0) || (cm_p->last_key[1] >= max_cntr_id))) {
-        ret = send_zone_port_dnstcp_stats(uuid, cm_p, tags_buf, 1, 1, db1, db2);
+        ret = send_zone_port_dnstcp_stats(uuid, cm_p, 1, 1, db1, db2, db_min, db_hr, db_day);
         memset(cm_p, 0, sizeof(cm_stat_dnstcp_t));
     }
 
@@ -3898,10 +3899,10 @@ int handle_port_dnstcp_stats(const char *uuid,
 }
 
 int send_zone_port_dnsudp_stats(const char *uuid, cm_stat_dnsudp_t *stats_p, 
-        const char *agent_info, int send_pps_bps, int send_cm, leveldb_t *db1, leveldb_t *db2)
+         int send_pps_bps, int send_cm, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
     char buf[2048];
-    int len = 0, ret = -1;
+    int len = 0, ret;
     json_object *data;
     char ts[11] = "";
     sprintf(ts, "%lu", stats_p->timestamp);
@@ -3930,7 +3931,7 @@ int send_zone_port_dnsudp_stats(const char *uuid, cm_stat_dnsudp_t *stats_p,
 
     if (send_pps_bps || send_cm) {
         leveldb_simple_write_data(key, json_object_to_json_string(data), db1);
-        leveldb_simple_write_data(uuid, ts, db2);
+        leveldb_downsampling(key, uuid, data, stats_p->timestamp, db2, db_min, db_hr, db_day);
         sf_debug("Writing data to Leveldb: uuid=%s", uuid);
     }
     return ret;
@@ -3938,7 +3939,7 @@ int send_zone_port_dnsudp_stats(const char *uuid, cm_stat_dnsudp_t *stats_p,
 
 int handle_port_dnsudp_stats(const char *uuid,
     struct sflow_flex_kv *kv, int num_counters,
-    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2)
+    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
     int i, len = 0, ret, idx;
     u32 key;
@@ -4070,14 +4071,14 @@ int handle_port_dnsudp_stats(const char *uuid,
 
     if ((cm_p->last_key[0] >= max_cntr_id) &&
         ((slot_id == 0) || (cm_p->last_key[1] >= max_cntr_id))) {
-        ret = send_zone_port_dnsudp_stats(uuid, cm_p, tags_buf, 1, 1, db1, db2);
+        ret = send_zone_port_dnsudp_stats(uuid, cm_p, 1, 1, db1, db2, db_min, db_hr, db_day);
         memset(cm_p, 0, sizeof(cm_stat_dnsudp_t));
     }
     return ret;
 }
 
 int send_zone_port_tcp_stats(const char *uuid, cm_stat_tcp_t *stats_p, 
-        u32 schema_oid, const char *agent_info, int send_pps_bps, int send_cm, leveldb_t *db1, leveldb_t *db2)
+        int send_pps_bps, int send_cm, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
     char buf[2048];
     int len = 0, ret;
@@ -4108,7 +4109,7 @@ int send_zone_port_tcp_stats(const char *uuid, cm_stat_tcp_t *stats_p,
 
     if (send_pps_bps || send_cm) {
         leveldb_simple_write_data(key, json_object_to_json_string(data), db1);
-        leveldb_simple_write_data(uuid, ts, db2);
+        leveldb_downsampling(key, uuid, data, stats_p->timestamp, db2, db_min, db_hr, db_day);
         sf_debug("Writing data to Leveldb: uuid=%s", uuid);
     }
 
@@ -4117,7 +4118,7 @@ int send_zone_port_tcp_stats(const char *uuid, cm_stat_tcp_t *stats_p,
 
 int handle_port_tcp_stats(const char *uuid,
     struct sflow_flex_kv *kv, int num_counters,
-    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2)
+    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
     int i, len = 0, ret, idx;
     u32 key;
@@ -4232,8 +4233,45 @@ int handle_port_tcp_stats(const char *uuid,
 
     if ((cm_p->last_key[0] >= max_cntr_id) &&
         ((slot_id == 0) || (cm_p->last_key[1] >= max_cntr_id))) {
-        ret = send_zone_port_tcp_stats(uuid, cm_p, STAT_OBJ_ID_PORT_TCP, tags_buf, 1, 1, db1, db2);
+        ret = send_zone_port_tcp_stats(uuid, cm_p, 1, 1, db1, db2, db_min, db_hr, db_day);
         memset(cm_p, 0, sizeof(cm_stat_tcp_t));
+    }
+
+    return ret;
+}
+
+int send_zone_port_udp_stats(const char *uuid, cm_stat_udp_t *stats_p, 
+        int send_pps_bps, int send_cm, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
+{
+    int ret;
+    json_object *data;
+    char ts[11] = "";
+    sprintf(ts, "%lu", stats_p->timestamp);
+    char key[100] = "";
+    sprintf(key, ".rpt.%s.%lu", uuid, stats_p->timestamp);
+    data = json_object_new_object();
+
+    if (send_pps_bps) {
+        json_object_object_add(data, "pkts_rcvd", json_object_new_int64(stats_p->pkts_rcvd));
+        json_object_object_add(data, "pkts_drop", json_object_new_int64(stats_p->pkts_drop));
+        json_object_object_add(data, "pkts_pass", json_object_new_int64(stats_p->pkts_pass));
+        json_object_object_add(data, "bytes_rcvd", json_object_new_int64(stats_p->bytes_rcvd));
+        json_object_object_add(data, "bytes_drop", json_object_new_int64(stats_p->bytes_drop));
+        json_object_object_add(data, "bytes_pass", json_object_new_int64(stats_p->bytes_pass));
+    }
+ 
+    if (send_cm) {
+        json_object_object_add(data, "udp_src_based_glid_drop", json_object_new_int64(stats_p->udp_src_based_glid_drop));
+        json_object_object_add(data, "udp_blacklist_drop", json_object_new_int64(stats_p->udp_blacklist_drop));
+        json_object_object_add(data, "udp_service_drop", json_object_new_int64(stats_p->udp_service_drop));
+        json_object_object_add(data, "udp_auth_drop", json_object_new_int64(stats_p->udp_auth_drop));
+        json_object_object_add(data, "udp_port_glid_drop", json_object_new_int64(stats_p->udp_port_glid_drop));
+    }
+
+    if (send_pps_bps || send_cm) {
+        leveldb_simple_write_data(key, json_object_to_json_string(data), db1);
+        leveldb_downsampling(key, uuid, data, stats_p->timestamp, db2, db_min, db_hr, db_day);
+        sf_debug("Writing data to Leveldb: uuid=%s", uuid);
     }
 
     return ret;
@@ -4241,7 +4279,7 @@ int handle_port_tcp_stats(const char *uuid,
 
 int handle_port_udp_stats(const char *uuid,
     struct sflow_flex_kv *kv, int num_counters,
-    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2)
+    void *cached_cm_p, int new_uuid, long tstamp, const char *tags_buf, int slot_id, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
     int i, len = 0, ret, idx;
     u32 key;
@@ -4346,7 +4384,7 @@ int handle_port_udp_stats(const char *uuid,
 
     if ((cm_p->last_key[0] >= max_cntr_id) &&
         ((slot_id == 0) || (cm_p->last_key[1] >= max_cntr_id))) {
-        //ret = send_cm_stat_to_tsdb(uuid, cm_p, STAT_OBJ_ID_PORT_UDP, tags_buf, db1, db2);
+        ret = send_zone_port_udp_stats(uuid, cm_p, 1, 1, db1, db2, db_min, db_hr, db_day);
         memset(cm_p, 0, sizeof(cm_stat_udp_t));
     }
     return ret;
@@ -4624,7 +4662,7 @@ static void *get_cm_stat_struct(const char *uuid, u32 schema_oid, int *new_uuid)
    _________________  readCounters_a10_4_1_n_generic     __________________
  -----------------___________________________------------------
 */
-static void readCounters_a10_4_1_n_generic(SFSample *sample, leveldb_t *db1, leveldb_t *db2)
+static void readCounters_a10_4_1_n_generic(SFSample *sample, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {   
     int len = 0, new_uuid = 0, slot_id = 0;
     struct sflow_flex_kv *keyval_p;
@@ -4657,25 +4695,25 @@ static void readCounters_a10_4_1_n_generic(SFSample *sample, leveldb_t *db1, lev
             //    handle_device_ddos_brief_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id);
             //    break;
             case STAT_OBJ_ID_ZONE:
-                handle_zone_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2);
+                handle_zone_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2, db_min, db_hr, db_day);
                 break;
             case STAT_OBJ_ID_PORT_HTTP:
-                handle_port_http_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2);
+                handle_port_http_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2, db_min, db_hr, db_day);
                 break;
             case STAT_OBJ_ID_PORT_SSLL4:
-                handle_port_ssll4_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2);
+                handle_port_ssll4_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2, db_min, db_hr, db_day);
                 break;
             case STAT_OBJ_ID_PORT_DNSTCP:
-                handle_port_dnstcp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2);
+                handle_port_dnstcp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2, db_min, db_hr, db_day);
                 break;
             case STAT_OBJ_ID_PORT_DNSUDP:
-                handle_port_dnsudp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2);
+                handle_port_dnsudp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2, db_min, db_hr, db_day);
                 break; 
             case STAT_OBJ_ID_PORT_TCP: // stats object OID for port tcp and ip-proto tcp is same
-                handle_port_tcp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2);
+                handle_port_tcp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2, db_min, db_hr, db_day);
                 break;
             case STAT_OBJ_ID_PORT_UDP: // stats object OID for port udp and ip-proto idp is same
-                handle_port_udp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2);
+                handle_port_udp_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id, db1, db2, db_min, db_hr, db_day);
                 break;
             /*case STAT_OBJ_ID_IPPROTO_OTHER:
                 handle_ipproto_other_stats(a10_custom->uuid, kv, number_of_counters, cm_p, new_uuid, tstamp, tbuf, slot_id);
@@ -5769,7 +5807,7 @@ typedef union {
 } sflow_enterprise_u;
 
 
-static void readCountersSample(SFSample *sample, int expanded, leveldb_t *db1, leveldb_t *db2)
+static void readCountersSample(SFSample *sample, int expanded, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
     uint32_t sampleLength;
     uint32_t num_elements;
@@ -5820,18 +5858,18 @@ static void readCountersSample(SFSample *sample, int expanded, leveldb_t *db1, l
 				//readCounters_generic(sample);
 				printf("\nhit SFLCOUNTERS_GENERIC_41n:\n");
 				//readCounters_a10_generic(sample);
-				readCounters_a10_4_1_n_generic(sample, db1, db2);
+				readCounters_a10_4_1_n_generic(sample, db1, db2, db_min, db_hr, db_day);
 				break;
 				// A10 3.2/4.1 SFlow Packet
 				//   case SFLCOUNTERS_DDOS_FLEX:
 		        case SFLCOUNTERS_DDOS_FLEX:
-                            readCounters_a10_4_1_n_generic(sample, db1, db2);
+                            readCounters_a10_4_1_n_generic(sample, db1, db2, db_min, db_hr, db_day);
                             break;
 			case SFL_COUNTER_REC_GENERIC_A10:    
 				{ 
 					printf("\nhit SFL_COUNTER_REC_GENERIC_A10_41n:\n");
 					//readCounters_a10_generic(sample);
-					readCounters_a10_4_1_n_generic(sample, db1, db2);
+					readCounters_a10_4_1_n_generic(sample, db1, db2, db_min, db_hr, db_day);
 					break;
 				}
 			default:
@@ -5857,7 +5895,7 @@ static void readCountersSample(SFSample *sample, int expanded, leveldb_t *db1, l
   -----------------___________________________------------------
 */
 
-static void readSFlowDatagram(SFSample *sample, leveldb_t *db1, leveldb_t *db2)
+static void readSFlowDatagram(SFSample *sample, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
     uint32_t samplesInPacket;
     struct timeval now;
@@ -5917,13 +5955,13 @@ static void readSFlowDatagram(SFSample *sample, leveldb_t *db1, leveldb_t *db2)
                         readFlowSample(sample, NO);
                         break;
                     case SFLCOUNTERS_SAMPLE:
-                        readCountersSample(sample, NO, db1, db2);
+                        readCountersSample(sample, NO, db1, db2, db_min, db_hr, db_day);
                         break;
                     case SFLFLOW_SAMPLE_EXPANDED:
                         readFlowSample(sample, YES);
                         break;
                     case SFLCOUNTERS_SAMPLE_EXPANDED:
-                        readCountersSample(sample, YES, db1, db2);
+                        readCountersSample(sample, YES, db1, db2, db_min, db_hr, db_day);
                         break;
                     default:
                         skipTLVRecord(sample, sample->sampleType, getData32(sample), "sample");
@@ -5952,7 +5990,7 @@ static void readSFlowDatagram(SFSample *sample, leveldb_t *db1, leveldb_t *db2)
   -----------------___________________________------------------
 */
 
-static void receiveSFlowDatagram(SFSample *sample, leveldb_t *db1, leveldb_t *db2)
+static void receiveSFlowDatagram(SFSample *sample, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
     if (sfConfig.forwardingTargets) {
         // if we are forwarding, then do nothing else (it might
@@ -5979,7 +6017,7 @@ static void receiveSFlowDatagram(SFSample *sample, leveldb_t *db1, leveldb_t *db
             // TRY
             sample->datap = (uint32_t *)sample->rawSample;
             sample->endp = (u_char *)sample->rawSample + sample->rawSampleLen;
-            readSFlowDatagram(sample, db1, db2);
+            readSFlowDatagram(sample, db1, db2, db_min, db_hr, db_day);
         } else {
             // CATCH
             fprintf(ERROUT, "caught exception: %d\n", exceptionVal);
@@ -6083,7 +6121,7 @@ static int ipv4MappedAddress(SFLIPv6 *ipv6addr, SFLIPv4 *ip4addr)
   -----------------___________________________------------------
 */
 
-static void readPacket(int soc, leveldb_t *db1, leveldb_t *db2)
+static void readPacket(int soc, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
     struct sockaddr_in6 peer;
     int alen, cc;
@@ -6113,7 +6151,7 @@ static void readPacket(int soc, leveldb_t *db1, leveldb_t *db2)
             sample.sourceIP.address.ip_v4 = v4src;
         }
     }
-    receiveSFlowDatagram(&sample, db1, db2);
+    receiveSFlowDatagram(&sample, db1, db2, db_min, db_hr, db_day);
 }
 
 /*_________________---------------------------__________________
@@ -6255,7 +6293,7 @@ static int pcapOffsetToSFlow(u_char *start, int len)
 
 
 
-static int readPcapPacket(FILE *file, leveldb_t *db1, leveldb_t *db2)
+static int readPcapPacket(FILE *file, leveldb_t *db1, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day)
 {
     u_char buf[2048];
     struct pcap_pkthdr hdr;
@@ -6300,7 +6338,7 @@ static int readPcapPacket(FILE *file, leveldb_t *db1, leveldb_t *db2)
         sample.rawSample = buf + skipBytes;
         sample.rawSampleLen = hdr.caplen - skipBytes;
         sample.pcapTimestamp = hdr.ts_sec;
-        receiveSFlowDatagram(&sample, db1, db2);
+        receiveSFlowDatagram(&sample, db1, db2, db_min, db_hr, db_day);
     }
     return 1;
 }
@@ -6640,16 +6678,28 @@ int main(int argc, char *argv[])
     }
 #endif
     uuidtable = sht_alloc(NUM_SHT_BUCKETS);
-    leveldb_t *db1, *db2;
-    leveldb_options_t *options1, *options2;
+    leveldb_t *db1, *db2, *db_min, *db_hr, *db_day;
+    leveldb_options_t *options1, *options2, *options3, *options4, *options5;
     char *err1 = NULL;
     char *err2 = NULL;
+    char *err3 = NULL;
+    char *err4 = NULL;
+    char *err5 = NULL;
     options1 = leveldb_options_create();
     options2 = leveldb_options_create();
+    options3 = leveldb_options_create();
+    options4 = leveldb_options_create();
+    options5 = leveldb_options_create();
     leveldb_options_set_create_if_missing(options1, 1);
     leveldb_options_set_create_if_missing(options2, 1);
+    leveldb_options_set_create_if_missing(options3, 1);
+    leveldb_options_set_create_if_missing(options4, 1);
+    leveldb_options_set_create_if_missing(options5, 1);
     db1 = leveldb_open(options1, RAW_DB,  &err1);
     db2 = leveldb_open(options2, UUID_STORE, &err2);
+    db_min = leveldb_open(options3, TABLE_MIN, &err3);
+    db_hr = leveldb_open(options4, TABLE_HOUR, &err4);
+    db_day = leveldb_open(options5, TABLE_DAY, &err5);
 
     /* reading from file or socket? */
     if (sfConfig.readPcapFileName) {
@@ -6691,7 +6741,7 @@ int main(int argc, char *argv[])
     }
     if (sfConfig.readPcapFile) {
         /* just use a blocking read */
-        while (readPcapPacket(sfConfig.readPcapFile, db1, db2));
+        while (readPcapPacket(sfConfig.readPcapFile, db1, db2, db_min, db_hr, db_day));
     } else {
         fd_set readfds;
         /* set the select mask */
@@ -6725,20 +6775,22 @@ int main(int argc, char *argv[])
             }
             if (nfds > 0) {
                 if (soc4 != -1 && FD_ISSET(soc4, &readfds)) {
-                    readPacket(soc4, db1, db2);
+                    readPacket(soc4, db1, db2, db_min, db_hr, db_day);
                 }
                 if (soc6 != -1 && FD_ISSET(soc6, &readfds)) {
-                    readPacket(soc6, db1, db2);
+                    readPacket(soc6, db1, db2, db_min, db_hr, db_day);
                 }
             }
         }
     }
     leveldb_close(db1);
     leveldb_close(db2);
+    leveldb_close(db_min);
+    leveldb_close(db_hr);
+    leveldb_close(db_day);
     return 0;
 }
 
-int batch = 0;
 int leveldb_simple_write_data(char *key, char *value, leveldb_t *db) {
     /* WRITE */
     size_t key_len = strlen(key), value_len = strlen(value);
@@ -6753,6 +6805,57 @@ int leveldb_simple_write_data(char *key, char *value, leveldb_t *db) {
     }
 
     leveldb_free(err); err = NULL;   
+    return 0;
+}
+
+int leveldb_downsampling(char *key, const char *uuid, json_object *data, long timestamp, leveldb_t *db2, leveldb_t *db_min, leveldb_t *db_hr, leveldb_t *db_day) {
+    json_object *ts_data;
+    leveldb_readoptions_t *roptions;
+    char *err = NULL;
+    char *uuid_cpy = strdup(uuid);
+    long min_start = 0, hr_start = 0, day_start = 0;
+    char *read;
+    size_t read_len, key_len = strlen(uuid);
+    roptions = leveldb_readoptions_create();
+    read = leveldb_get(db2, roptions, uuid, key_len, &read_len, &err);
+    if (err != NULL || read == NULL) {
+        ts_data = json_object_new_object();
+        json_object_object_add(ts_data, "sec_start", json_object_new_int64(timestamp));
+        json_object_object_add(ts_data, "min_start", json_object_new_int64(timestamp));
+        json_object_object_add(ts_data, "hr_start", json_object_new_int64(timestamp));
+        json_object_object_add(ts_data, "day_start", json_object_new_int64(timestamp));
+        leveldb_simple_write_data(uuid_cpy, json_object_to_json_string(ts_data), db2);
+        leveldb_simple_write_data(key, json_object_to_json_string(data), db_min);
+        leveldb_simple_write_data(key, json_object_to_json_string(data), db_hr);
+        leveldb_simple_write_data(key, json_object_to_json_string(data), db_day);
+    } else {
+        json_object *obj, *t_obj, *new_obj;
+        obj = json_tokener_parse(read);
+        new_obj = json_object_new_object();
+        json_object_object_add(new_obj, "sec_start", json_object_new_int64(timestamp));
+        t_obj = json_object_object_get(obj, "min_start");
+        min_start = json_object_get_int64(t_obj);
+        if (timestamp - min_start > 60) {
+            min_start = timestamp - timestamp % 60;
+            leveldb_simple_write_data(key, json_object_to_json_string(data), db_min);
+        }
+        json_object_object_add(new_obj, "min_start", json_object_new_int64(timestamp));
+        t_obj = json_object_object_get(obj, "hr_start");
+        hr_start = json_object_get_int64(t_obj);
+        if (timestamp - hr_start > 3600) {
+            hr_start = timestamp - timestamp % 3600;
+            leveldb_simple_write_data(key, json_object_to_json_string(data), db_hr);
+        }
+        json_object_object_add(new_obj, "hr_start", json_object_new_int64(timestamp));
+        t_obj = json_object_object_get(obj, "day_start");
+        day_start = json_object_get_int64(t_obj);
+        if (timestamp - day_start > 86400) {
+            day_start = timestamp - timestamp % 86400;
+            leveldb_simple_write_data(key, json_object_to_json_string(data), db_day);
+        }
+        json_object_object_add(new_obj, "day_start", json_object_new_int64(timestamp));
+        leveldb_simple_write_data(uuid_cpy, json_object_to_json_string(new_obj), db2);
+    }
     return 0;
 }
 
